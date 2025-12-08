@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Cache bust para forçar rebuild
+ENV CACHE_BUST=2025-12-07-v3
+
 # Metadados
 LABEL maintainer="MEIre Team"
 LABEL description="OCR Service para comprovantes fiscais brasileiros"
