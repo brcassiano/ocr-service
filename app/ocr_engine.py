@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class OCREngine:
     """Motor de OCR para comprovantes fiscais brasileiros"""
     
-    # Palavras-chave para detecção de tipo de documento
+    # Palavras-chave para detecção de tipo
     KEYWORDS_GASTO = [
         'cupom', 'nota fiscal', 'nfc-e', 'nf-e', 'compra', 'pagamento',
         'débito', 'debito', 'crédito', 'credito', 'cartão', 'cartao',
@@ -28,22 +28,27 @@ class OCREngine:
         'comprovante de recebimento'
     ]
     
+    # Palavras a IGNORAR (não são itens de compra)
+    IGNORE_KEYWORDS = [
+        'trib', 'tribut', 'aprox', 'fed', 'est', 'mun',
+        'total', 'subtotal', 'desconto', 'acrescimo',
+        'troco', 'dinheiro', 'cartao', 'cartão',
+        'qtd.', 'quantidade', 'codigo', 'sq.codigo',
+        'cnpj', 'cpf', 'ie:', 'protocolo', 'autorizacao',
+        'emissao', 'consumidor', 'referente', 'pix:',
+        'nsu:', 'data:', 'valor:', 'fonte:', 'ibpt'
+    ]
+    
     def __init__(self, use_gpu: bool = False):
-        """
-        Inicializa o motor OCR
-        
-        Args:
-            use_gpu: Se True, usa GPU para processamento (requer CUDA)
-        """
         try:
             self.ocr = PaddleOCR(
-                use_angle_cls=True,      # Detecta rotação do texto
-                lang='pt',                # Português
+                use_angle_cls=True,
+                lang='pt',
                 use_gpu=use_gpu,
                 show_log=False,
-                det_db_thresh=0.3,       # Threshold de detecção
-                det_db_box_thresh=0.5,   # Threshold de confiança da box
-                rec_batch_num=6          # Processar 6 linhas por vez
+                det_db_thresh=0.3,
+                det_db_box_thresh=0.5,
+                rec_batch_num=6
             )
             logger.info(f"PaddleOCR inicializado (GPU: {use_gpu})")
         except Exception as e:
@@ -53,51 +58,49 @@ class OCREngine:
         self.text_processor = TextProcessor()
     
     def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
-        """
-        Extrai QR Codes da imagem
-        
-        Args:
-            image_bytes: Bytes da imagem
-            
-        Returns:
-            Lista de dicts com dados dos QR Codes encontrados, ou None
-        """
+        """Extrai QR Codes com múltiplas tentativas"""
         try:
-            # Converter bytes para numpy array
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if img is None:
-                logger.error("Falha ao decodificar imagem para QR Code")
+                logger.error("Falha ao decodificar imagem")
                 return None
             
-            # Pré-processamento para melhorar detecção
+            # Tentativa 1: Escala de cinza simples
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            decoded = decode(gray)
             
-            # Tentar com imagem normal
-            decoded_objects = decode(gray)
+            # Tentativa 2: Threshold binário
+            if not decoded:
+                _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+                decoded = decode(binary)
             
-            # Se não encontrou, tentar com threshold adaptativo
-            if not decoded_objects:
-                thresh = cv2.adaptiveThreshold(
-                    gray, 255, 
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            # Tentativa 3: Threshold adaptativo
+            if not decoded:
+                adaptive = cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                     cv2.THRESH_BINARY, 11, 2
                 )
-                decoded_objects = decode(thresh)
+                decoded = decode(adaptive)
             
-            if not decoded_objects:
-                logger.info("Nenhum QR Code encontrado na imagem")
+            # Tentativa 4: Aumentar contraste
+            if not decoded:
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                enhanced = clahe.apply(gray)
+                decoded = decode(enhanced)
+            
+            if not decoded:
+                logger.info("Nenhum QR Code detectado após 4 tentativas")
                 return None
             
-            # Processar resultados
             qr_results = []
-            for obj in decoded_objects:
+            for obj in decoded:
                 if obj.type == 'QRCODE':
                     try:
-                        data_decoded = obj.data.decode('utf-8')
+                        data = obj.data.decode('utf-8')
                         qr_results.append({
-                            'data': data_decoded,
+                            'data': data,
                             'type': obj.type,
                             'rect': {
                                 'left': obj.rect.left,
@@ -106,9 +109,9 @@ class OCREngine:
                                 'height': obj.rect.height
                             }
                         })
-                        logger.info(f"QR Code encontrado: {data_decoded[:50]}...")
+                        logger.info(f"QR Code encontrado: {data[:80]}...")
                     except Exception as e:
-                        logger.warning(f"Erro ao decodificar QR Code: {e}")
+                        logger.warning(f"Erro ao decodificar QR: {e}")
             
             return qr_results if qr_results else None
             
@@ -117,51 +120,36 @@ class OCREngine:
             return None
     
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
-        """
-        Executa OCR completo na imagem
-        
-        Args:
-            image_bytes: Bytes da imagem
-            
-        Returns:
-            Lista de dicts com texto extraído e metadados
-        """
+        """Executa OCR completo"""
         try:
-            # Converter para numpy array
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if img is None:
-                logger.error("Falha ao decodificar imagem para OCR")
+                logger.error("Falha ao decodificar imagem")
                 return []
             
-            # Pré-processamento para melhorar OCR
-            # Converter para escala de cinza
+            # Pré-processamento
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            # Aplicar denoising
             denoised = cv2.fastNlMeansDenoising(gray)
             
-            # Executar OCR
+            # OCR
             result = self.ocr.ocr(denoised, cls=True)
             
             if not result or not result[0]:
                 logger.warning("OCR não retornou resultados")
                 return []
             
-            # Processar resultados
             lines = []
             confidences = []
             
             for line in result[0]:
-                box = line[0]           # Coordenadas [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                text_data = line[1]     # (texto, confiança)
+                box = line[0]
+                text_data = line[1]
                 text = text_data[0]
                 confidence = text_data[1]
                 
-                # Filtrar resultados de baixa confiança
                 if confidence > 0.5:
-                    # Calcular posição Y média da box
                     y_positions = [point[1] for point in box]
                     avg_y = sum(y_positions) / len(y_positions)
                     
@@ -173,12 +161,10 @@ class OCREngine:
                     })
                     confidences.append(confidence)
             
-            # Ordenar por posição vertical (top to bottom)
             lines.sort(key=lambda x: x['y_position'])
             
-            # Calcular confiança média
             avg_confidence = sum(confidences) / len(confidences) if confidences else 0
-            logger.info(f"OCR extraiu {len(lines)} linhas (confiança média: {avg_confidence:.2%})")
+            logger.info(f"OCR: {len(lines)} linhas (confiança: {avg_confidence:.2%})")
             
             return lines
             
@@ -187,230 +173,212 @@ class OCREngine:
             return []
     
     def _detect_document_type(self, text: str) -> str:
-        """
-        Detecta se documento é gasto ou venda baseado em palavras-chave
-        
-        Args:
-            text: Texto completo extraído
-            
-        Returns:
-            'gasto', 'venda' ou 'gasto' (default)
-        """
+        """Detecta tipo de documento"""
         text_lower = text.lower()
         
-        # Contadores de matches
-        gasto_score = 0
         venda_score = 0
+        gasto_score = 0
         
-        # Verificar keywords de venda (peso maior)
         for keyword in self.KEYWORDS_VENDA:
             if keyword in text_lower:
                 venda_score += 2
-                logger.debug(f"Keyword venda encontrada: '{keyword}'")
         
-        # Verificar keywords de gasto
         for keyword in self.KEYWORDS_GASTO:
             if keyword in text_lower:
                 gasto_score += 1
-                logger.debug(f"Keyword gasto encontrada: '{keyword}'")
         
-        # Heurísticas adicionais
-        
-        # Se tem "receb" (recebido, recebimento, etc), provavelmente é venda
         if re.search(r'receb\w*', text_lower):
             venda_score += 3
         
-        # Se tem "pag" (pagamento, pago, pagar), provavelmente é gasto
         if re.search(r'pag\w*', text_lower):
             gasto_score += 2
         
-        # Detectar comprovantes de transferência/PIX
-        if any(word in text_lower for word in ['pix', 'ted', 'doc', 'transferência', 'transferencia']):
-            # Se tem "enviado" ou "para", é gasto
-            if any(word in text_lower for word in ['enviado', 'para:', 'destinatário', 'destinatario']):
-                gasto_score += 2
-            # Se tem "recebido" ou "de", é venda
-            elif any(word in text_lower for word in ['recebido', 'de:', 'remetente', 'origem']):
-                venda_score += 3
-        
-        # Decisão final
-        if venda_score > gasto_score:
-            tipo = 'venda'
-        else:
-            tipo = 'gasto'  # Default para gasto
-        
-        logger.info(f"Tipo detectado: {tipo} (venda_score={venda_score}, gasto_score={gasto_score})")
+        tipo = 'venda' if venda_score > gasto_score else 'gasto'
+        logger.info(f"Tipo: {tipo} (venda={venda_score}, gasto={gasto_score})")
         return tipo
     
-    def _extract_items(self, lines: List[Dict], tipo: str) -> List[Dict]:
-        """
-        Extrai itens estruturados das linhas OCR
+    def _is_item_line(self, text: str) -> bool:
+        """Verifica se linha contém um item de compra válido"""
+        text_lower = text.lower()
         
-        Args:
-            lines: Lista de linhas extraídas pelo OCR
-            tipo: Tipo do documento ('gasto' ou 'venda')
-            
-        Returns:
-            Lista de itens estruturados
-        """
+        # Filtrar linhas que devem ser ignoradas
+        for keyword in self.IGNORE_KEYWORDS:
+            if keyword in text_lower:
+                return False
+        
+        # Linha de item geralmente tem:
+        # - Código de produto OU
+        # - Nome de produto + valor
+        
+        # Verificar se tem padrão de item com valor
+        # Exemplo: "01 07500435157476 AP GILLETTE FEM C2U 1 UN x 8,48 F 8,48"
+        has_price = bool(re.search(r'\d+[.,]\d{2}', text))
+        has_quantity = bool(re.search(r'\d+\s*(un|kg|lt|l|pc|pç)', text_lower))
+        has_code = bool(re.search(r'^\d{2}\s+\d{8,}', text))  # Código de produto no início
+        
+        # Se tem código de produto longo + preço, provavelmente é item
+        if has_code and has_price:
+            return True
+        
+        # Se tem quantidade e preço, provavelmente é item
+        if has_quantity and has_price:
+            return True
+        
+        # Se linha é muito curta (< 10 chars), provavelmente não é item
+        if len(text.strip()) < 10:
+            return False
+        
+        return False
+    
+    def _extract_items(self, lines: List[Dict], tipo: str) -> List[Dict]:
+        """Extrai itens com lógica melhorada"""
         if not lines:
             return []
         
-        # Concatenar texto completo
         full_text = '\n'.join([line['text'] for line in lines])
         
-        # Extrair valores e datas
-        valores = self.text_processor.extract_money_values(full_text)
+        # Extrair datas do texto completo
         datas = self.text_processor.extract_dates(full_text)
-        
-        # Pegar primeira data encontrada ou usar data atual
         data_documento = datas[0] if datas else datetime.now().strftime('%d/%m/%Y')
-        
-        if not valores:
-            logger.warning("Nenhum valor monetário encontrado")
-            return []
         
         itens = []
         
         if tipo == 'venda':
-            # Para vendas: normalmente 1 único lançamento
-            valor_total = max(valores)  # Maior valor é geralmente o total
-            
-            itens.append({
-                "item": None,
-                "quantidade": None,
-                "valor_unitario": None,
-                "valor_total": valor_total,
-                "data_venda": data_documento
-            })
-            
-            logger.info(f"Venda extraída: R$ {valor_total:.2f}")
+            # Para vendas: pegar maior valor
+            valores = self.text_processor.extract_money_values(full_text)
+            if valores:
+                valor_total = max(valores)
+                itens.append({
+                    "item": None,
+                    "quantidade": None,
+                    "valor_unitario": None,
+                    "valor_total": valor_total,
+                    "data_venda": data_documento
+                })
+                logger.info(f"Venda: R$ {valor_total:.2f}")
         
         else:  # gasto
-            # Para gastos: tentar identificar múltiplos itens
+            # Processar cupom fiscal linha por linha
+            total_cupom = None
             
-            # Se encontrou apenas 1 ou 2 valores, criar item único
-            if len(valores) <= 2:
-                valor_total = max(valores)
+            for line in lines:
+                text = line['text']
                 
-                # Tentar identificar nome do item
-                item_name = self._find_item_name_near_value(lines, valor_total)
+                # Identificar linha de TOTAL
+                if re.search(r'(total|pix)\s*\(r\$\)?\s*(\d+[.,]\d{2})', text, re.IGNORECASE):
+                    match = re.search(r'(\d+[.,]\d{2})', text)
+                    if match:
+                        total_str = match.group(1).replace(',', '.')
+                        total_cupom = float(total_str)
+                        logger.info(f"Total do cupom: R$ {total_cupom:.2f}")
+                        continue
                 
-                itens.append({
-                    "item": item_name or "Item",
-                    "quantidade": 1,
-                    "valor_unitario": valor_total,
-                    "valor_total": valor_total,
-                    "data_compra": data_documento
-                })
+                # Verificar se é linha de item
+                if self._is_item_line(text):
+                    item_data = self._parse_item_line(text)
+                    if item_data:
+                        item_data['data_compra'] = data_documento
+                        itens.append(item_data)
+                        logger.info(f"Item extraído: {item_data['item']} - R$ {item_data['valor_total']:.2f}")
             
-            else:
-                # Múltiplos valores: último geralmente é o total
-                total_provavel = max(valores)
-                valores_itens = [v for v in valores if v < total_provavel]
-                
-                # Se não sobrou nada, usar todos
-                if not valores_itens:
-                    valores_itens = valores[:-1]  # Todos exceto o último
-                
-                # Criar itens
-                for idx, valor in enumerate(valores_itens, 1):
-                    item_name = self._find_item_name_near_value(lines, valor)
+            # Se não encontrou itens, mas encontrou valores
+            if not itens:
+                valores = self.text_processor.extract_money_values(full_text)
+                if valores:
+                    # Usar total se encontrou, senão maior valor
+                    valor_total = total_cupom if total_cupom else max(valores)
                     
                     itens.append({
-                        "item": item_name or f"Item {idx}",
+                        "item": "Item não identificado",
                         "quantidade": 1,
-                        "valor_unitario": valor,
-                        "valor_total": valor,
+                        "valor_unitario": valor_total,
+                        "valor_total": valor_total,
                         "data_compra": data_documento
                     })
-                
-                logger.info(f"Gasto extraído: {len(itens)} itens, total R$ {total_provavel:.2f}")
+                    logger.warning("Não conseguiu identificar itens individuais")
         
         return itens
     
-    def _find_item_name_near_value(self, lines: List[Dict], valor: float) -> Optional[str]:
+    def _parse_item_line(self, text: str) -> Optional[Dict]:
         """
-        Tenta encontrar nome do item próximo ao valor monetário
-        
-        Args:
-            lines: Linhas do OCR
-            valor: Valor monetário a procurar
-            
-        Returns:
-            Nome do item ou None
+        Parse de linha de item do cupom fiscal
+        Formato comum: "01 07500435157476 AP GILLETTE FEM C2U 1 UN x 8,48 F 8,48"
         """
-        valor_str_patterns = [
-            f"{valor:.2f}",                          # 10.50
-            f"{valor:,.2f}".replace(",", "."),      # 1.000.50
-            f"R$ {valor:.2f}",
-            f"R${valor:.2f}",
-        ]
-        
-        # Procurar linha que contém o valor
-        for i, line in enumerate(lines):
-            line_text = line['text']
+        try:
+            # Extrair todos os valores monetários da linha
+            valores = re.findall(r'(\d+[.,]\d{2})', text)
+            if not valores:
+                return None
             
-            # Verificar se linha contém o valor
-            if any(pattern in line_text for pattern in valor_str_patterns):
-                # Pegar texto antes do valor na mesma linha
-                for pattern in valor_str_patterns:
-                    if pattern in line_text:
-                        item_name = line_text.split(pattern)[0].strip()
-                        if item_name and len(item_name) > 2:
-                            return self.text_processor.clean_item_name(item_name)
-                
-                # Se não achou na mesma linha, tentar linha anterior
-                if i > 0:
-                    prev_line = lines[i-1]['text']
-                    if not any(char.isdigit() for char in prev_line):  # Não contém números
-                        return self.text_processor.clean_item_name(prev_line)
-        
-        return None
+            # Último valor geralmente é o total do item
+            valor_total_str = valores[-1].replace(',', '.')
+            valor_total = float(valor_total_str)
+            
+            # Extrair quantidade (padrão: número antes de UN/KG/etc)
+            quantidade = 1
+            qty_match = re.search(r'(\d+)\s*(un|kg|lt|l|pc|pç)', text, re.IGNORECASE)
+            if qty_match:
+                quantidade = float(qty_match.group(1))
+            
+            # Calcular valor unitário
+            if len(valores) >= 2:
+                valor_unit_str = valores[-2].replace(',', '.')
+                valor_unitario = float(valor_unit_str)
+            else:
+                valor_unitario = valor_total / quantidade
+            
+            # Extrair nome do item (texto entre código e quantidade/valor)
+            # Remover código inicial (padrão: 2 dígitos + 13 dígitos)
+            text_clean = re.sub(r'^\d{2}\s+\d{8,}', '', text).strip()
+            
+            # Remover valores e quantidades
+            for val in valores:
+                text_clean = text_clean.replace(val, '')
+            text_clean = re.sub(r'\d+\s*(un|kg|lt|l|pc|pç)', '', text_clean, flags=re.IGNORECASE)
+            text_clean = re.sub(r'\s+x\s+', ' ', text_clean)
+            text_clean = re.sub(r'\s+[a-z]\s+', ' ', text_clean)  # Remover letras soltas (F, T, etc)
+            
+            item_name = self.text_processor.clean_item_name(text_clean)
+            
+            if not item_name or len(item_name) < 3:
+                item_name = "Item"
+            
+            return {
+                "item": item_name,
+                "quantidade": quantidade,
+                "valor_unitario": round(valor_unitario, 2),
+                "valor_total": round(valor_total, 2)
+            }
+            
+        except Exception as e:
+            logger.error(f"Erro ao fazer parse de item: {e}")
+            return None
     
     def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
-        """
-        Estrutura dados extraídos em formato JSON final
-        
-        Args:
-            ocr_lines: Linhas extraídas pelo OCR
-            qr_data: Dados do QR Code (se houver)
-            
-        Returns:
-            Dict com estrutura final
-        """
+        """Estrutura dados finais"""
         if not ocr_lines:
             return {
                 "tipo_documento": "erro",
                 "itens": [],
                 "qrcode_url": None,
-                "mensagem": "Não consegui extrair texto da imagem. Tente enviar uma foto mais nítida.",
+                "mensagem": "Não consegui extrair texto da imagem. Tente uma foto mais nítida.",
                 "confianca": 0.0
             }
         
-        # Texto completo
         full_text = '\n'.join([line['text'] for line in ocr_lines])
-        
-        # Detectar tipo
         tipo = self._detect_document_type(full_text)
-        
-        # Extrair itens
         itens = self._extract_items(ocr_lines, tipo)
-        
-        # QR Code URL
         qr_url = qr_data[0]['data'] if qr_data else None
         
-        # Confiança média
         confidences = [line['confidence'] for line in ocr_lines]
         avg_confidence = sum(confidences) / len(confidences)
         
-        # Validar se conseguiu extrair dados mínimos
         if not itens:
             return {
                 "tipo_documento": "erro",
                 "itens": [],
                 "qrcode_url": qr_url,
-                "mensagem": "Consegui ler a imagem, mas não encontrei valores monetários. Tente uma foto mais clara dos valores.",
+                "mensagem": "Consegui ler a imagem, mas não encontrei itens válidos. Tente uma foto mais clara.",
                 "confianca": avg_confidence
             }
         
