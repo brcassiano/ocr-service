@@ -8,10 +8,23 @@ from typing import List, Dict, Optional
 import logging
 from .utils import TextProcessor
 
+# PRINT PARA FORÇAR DETECÇÃO DE CÓDIGO NOVO
+print("=" * 80)
+print(">>> OCR_ENGINE.PY VERSÃO NOVA CARREGADA - TIMESTAMP: 2025-12-08-02:45 <<<")
+print("=" * 80)
+
 logger = logging.getLogger(__name__)
 
 class OCREngine:
     """Motor OCR com extração permissiva e logs detalhados"""
+    
+    KEYWORDS_VENDA = ['recebido', 'pix recebido', 'crédito em conta', 'depósito', 'recibo']
+
+    def __init__(self, use_gpu: bool = False):
+        print(">>> DENTRO DO __INIT__ DO OCR ENGINE <<<")  # Print adicional
+        logger.info("=" * 60)
+        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO NOVA COM LOGS DETALHADOS")
+        logger.info("=" * 60)
     
     KEYWORDS_VENDA = ['recebido', 'pix recebido', 'crédito em conta', 'depósito', 'recibo']
 
