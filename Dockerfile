@@ -4,10 +4,10 @@ FROM python:3.11-slim
 LABEL maintainer="MEIre Team"
 LABEL description="OCR Service para comprovantes fiscais brasileiros"
 
-# Instalar dependências do sistema
+# Instalar dependências do sistema (CORRIGIDO para Debian Trixie)
 RUN apt-get update && apt-get install -y \
     libzbar0 \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
