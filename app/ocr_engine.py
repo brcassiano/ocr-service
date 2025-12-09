@@ -217,11 +217,10 @@ class OCREngine:
         itens: List[Dict] = []
 
         # -------- NFC-e: linhas começando com 01 / 02 / 03 etc --------
-        for line in lines:
+                for line in lines:
             raw = line['text']
             text = " ".join(raw.split())  # normaliza espaços
 
-            # Mais permissivo: exige só que comece com número da linha
             m = re.match(r'^(\d{1,2})\s+(.+)$', text)
             if not m:
                 continue
@@ -229,7 +228,6 @@ class OCREngine:
             resto = m.group(2)  # produto + quantidade + valores
             logger.info(f"  Linha NFC-e detectada: {text}")
 
-            # valores monetários na linha
             valores = re.findall(r'(\d+[.,]\d{2})', resto)
             if not valores:
                 logger.info("    Nenhum valor encontrado nesta linha, pulando.")
@@ -238,26 +236,28 @@ class OCREngine:
             valor_total = float(valores[-1].replace(',', '.'))
             valor_unit = float(valores[-2].replace(',', '.')) if len(valores) >= 2 else valor_total
 
-            # quantidade (antes de UN/KG/LT/L)
             m_qtd = re.search(r'(\d+)\s*(?:UN|KG|LT|L)\b', resto, re.IGNORECASE)
             qtd = float(m_qtd.group(1)) if m_qtd else 1.0
 
-            # nome do produto
-            nome = resto
-            if m_qtd:
-                # remove trecho "1 UN x 8,48 F 8,48" ou parecido
-                nome = re.sub(
-                    r'\s+\d+\s*(?:UN|KG|LT|L)\s*x\s*[\d.,]+.*$',
-                    '',
-                    nome,
-                    flags=re.IGNORECASE
-                )
-            else:
-                # fallback: remove valores e unidades
-                nome = re.sub(r'\d+[.,]\d{2}', '', nome)
-                nome = re.sub(r'\d+\s*(?:UN|KG|LT|L)', '', nome, flags=re.IGNORECASE)
+            # NOVO: extrair nome por tokens, ignorando números, UN, x, F, etc.
+            tokens = resto.split()
+            product_tokens = []
+            for t in tokens:
+                t_clean = t.replace('.', '').replace(',', '')
 
-            nome = nome.strip(" -")
+                # pular números puros (códigos, quantidades, preços)
+                if t_clean.isdigit():
+                    continue
+                if re.match(r'^[\d.,]+$', t):
+                    continue
+
+                # pular unidades/sufixos comuns
+                if t.upper() in ['UN', 'KG', 'LT', 'L', 'X', 'F', 'R$']:
+                    continue
+
+                product_tokens.append(t)
+
+            nome = " ".join(product_tokens).strip(" -")
             if len(nome) < 3:
                 nome = "Produto"
 
