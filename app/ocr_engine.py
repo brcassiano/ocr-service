@@ -56,16 +56,20 @@ class OCREngine:
             logger.info(f"  Imagem: {img.shape[1]}x{img.shape[0]} pixels")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # -------- 1) TENTATIVAS COM PYZBAR --------
+            # 1) Tentativas com pyzbar
             attempts = [
                 ("grayscale normal", gray),
-                ("threshold binário", cv2.threshold(gray, 0, 255,
-                                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
-                ("CLAHE contraste", cv2.createCLAHE(clipLimit=3.0,
-                                                    tileGridSize=(8, 8)).apply(gray)),
-                ("resize 2x", cv2.resize(gray,
-                                         (gray.shape[1] * 2, gray.shape[0] * 2),
-                                         interpolation=cv2.INTER_CUBIC))
+                ("threshold binário", cv2.threshold(
+                    gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                )[1]),
+                ("CLAHE contraste", cv2.createCLAHE(
+                    clipLimit=3.0, tileGridSize=(8, 8)
+                ).apply(gray)),
+                ("resize 2x", cv2.resize(
+                    gray,
+                    (gray.shape[1] * 2, gray.shape[0] * 2),
+                    interpolation=cv2.INTER_CUBIC
+                )),
             ]
 
             for method, processed_img in attempts:
@@ -81,7 +85,7 @@ class OCREngine:
                     if results:
                         return results
 
-            # -------- 2) FALLBACK COM OPENCV QRCodeDetector --------
+            # 2) Fallback com OpenCV QRCodeDetector
             logger.info("  Pyzbar não encontrou nada, tentando OpenCV QRCodeDetector...")
             detector = cv2.QRCodeDetector()
             data, points, _ = detector.detectAndDecode(img)
@@ -216,7 +220,8 @@ class OCREngine:
 
     def _extract_items_nfe_first(self, lines: List[Dict], full_text: str, tipo: str) -> List[Dict]:
         """
-        1º tenta extrair itens no padrão NFC-e (linhas 01/02/...).
+        1º tenta extrair itens no padrão NFC-e (linhas 01/02/C2/C3/...).
+        Agrupa por bloco de linhas de cada item.
         Se falhar e não for NFC-e, faz um fallback bem conservador.
         """
         logger.info("→ Extraindo itens (priorizando NFC-e)...")
@@ -225,66 +230,104 @@ class OCREngine:
         logger.info(f"  Data detectada: {data_compra}")
 
         is_nfce = "DOCUMENTO AUXILIAR DA NOTA FISCAL DE CONSUMIDOR" in full_text.upper()
-
         itens: List[Dict] = []
 
-        # -------- NFC-e: linhas começando com 01 / 02 / 03 etc --------
-        for line in lines:
-            raw = line['text']
-            text = " ".join(raw.split())  # normaliza espaços
+        # 1) Encontrar cabeçalhos de itens (01, 02, C2, C3, 04...)
+        header_indices: List[int] = []
+        header_pattern = re.compile(r'^(?:\d{1,2}|C\d)\s+\d{5,}\b')
 
-            m = re.match(r'^(\d{1,2})\s+(.+)$', text)
-            if not m:
-                continue
+        for idx, line in enumerate(lines):
+            text = " ".join(line['text'].split())
+            if header_pattern.match(text):
+                header_indices.append(idx)
 
-            resto = m.group(2)  # produto + quantidade + valores
-            logger.info(f"  Linha NFC-e detectada: {text}")
+        if not header_indices:
+            logger.warning("  Nenhum cabeçalho de item NFC-e detectado.")
+        else:
+            logger.info(f"  Cabeçalhos de itens detectados em índices: {header_indices}")
 
-            valores = re.findall(r'(\d+[.,]\d{2})', resto)
-            if not valores:
-                logger.info("    Nenhum valor encontrado nesta linha, pulando.")
-                continue
+        # 2) Para cada cabeçalho, agrupar linhas e extrair dados
+        for i, start in enumerate(header_indices):
+            # fim do grupo: antes do próximo cabeçalho ou no máximo 4 linhas adiante
+            if i + 1 < len(header_indices):
+                end = header_indices[i + 1] - 1
+            else:
+                end = start + 4
+            end = min(end, len(lines) - 1)
 
-            valor_total = float(valores[-1].replace(',', '.'))
-            valor_unit = float(valores[-2].replace(',', '.')) if len(valores) >= 2 else valor_total
+            group_lines = lines[start:end + 1]
+            header_text = " ".join(group_lines[0]['text'].split())
+            other_text = " ".join(l['text'] for l in group_lines[1:])
+            logger.info(f"  Grupo de linhas {start}-{end}: '{header_text}' / '{other_text}'")
 
-            m_qtd = re.search(r'(\d+)\s*(?:UN|KG|LT|L)\b', resto, re.IGNORECASE)
-            qtd = float(m_qtd.group(1)) if m_qtd else 1.0
-
-            # NOVO: extrair nome por tokens, ignorando números, UN, x, F, etc.
-            tokens = resto.split()
-            product_tokens = []
-            for t in tokens:
-                t_clean = t.replace('.', '').replace(',', '')
-
-                # pular números puros (códigos, quantidades, preços)
-                if t_clean.isdigit():
-                    continue
-                if re.match(r'^[\d.,]+$', t):
-                    continue
-
-                # pular unidades/sufixos comuns
-                if t.upper() in ['UN', 'KG', 'LT', 'L', 'X', 'F', 'R$']:
-                    continue
-
-                product_tokens.append(t)
-
-            nome = " ".join(product_tokens).strip(" -")
+            # Nome do produto a partir do cabeçalho
+            header_clean = re.sub(r'^(?:\d{1,2}|C\d)\s+\d{5,}\s*', '', header_text)
+            header_clean = re.sub(r'\s+(KG|UN|LT|L)\s*$', '', header_clean, flags=re.IGNORECASE)
+            nome = header_clean.strip(" -")
             if len(nome) < 3:
                 nome = "Produto"
 
-            logger.info(f"    ✓ Item NFC-e: nome='{nome}', qtd={qtd}, unit={valor_unit}, total={valor_total}")
+            # Quantidade (usar ÚLTIMA ocorrência para evitar MEG8)
+            qtd = 1.0
+            qtd_matches = list(re.finditer(
+                r'([0-9]+[.,]?[0-9]*)\s*(KG|UN|LT|L)\b',
+                other_text,
+                re.IGNORECASE
+            ))
+            if qtd_matches:
+                m_qtd = qtd_matches[-1]
+                qtd = float(m_qtd.group(1).replace(',', '.'))
+
+            # Valor unitário (após 'x ')
+            unit_match = re.search(r'x\s*([0-9]+[.,][0-9]{2})', other_text)
+            valor_unit = None
+            if unit_match:
+                valor_unit = float(unit_match.group(1).replace(',', '.'))
+
+            # Candidatos a valores monetários no bloco
+            nums = [
+                float(v.replace(',', '.'))
+                for v in re.findall(r'([0-9]+[.,][0-9]{2})', other_text)
+            ]
+
+            valor_total = None
+            if valor_unit is not None and nums:
+                esperado = qtd * valor_unit
+                valor_total = min(nums, key=lambda v: abs(v - esperado))
+                logger.info(
+                    f"    Valores no grupo: {nums}, esperado={esperado:.2f}, "
+                    f"total escolhido={valor_total:.2f}"
+                )
+            elif nums:
+                valor_total = nums[-1]
+                logger.info(
+                    f"    Sem qty/unit claros, usando último valor do grupo: {valor_total:.2f}"
+                )
+
+            if valor_total is None and valor_unit is not None:
+                valor_total = round(qtd * valor_unit, 2)
+
+            if valor_total is None:
+                logger.warning(
+                    f"    Não foi possível determinar total para o item '{nome}', pulando."
+                )
+                continue
+
+            logger.info(
+                f"    ✓ Item NFC-e: nome='{nome}', qtd={qtd}, "
+                f"unit={valor_unit}, total={valor_total}"
+            )
 
             itens.append({
                 "item": nome,
                 "quantidade": qtd,
-                "valor_unitario": round(valor_unit, 2),
+                "valor_unitario": round(valor_unit, 2) if valor_unit is not None else None,
                 "valor_total": round(valor_total, 2),
                 "data_compra": data_compra if tipo == 'gasto' else None,
                 "data_venda": data_compra if tipo == 'venda' else None,
             })
 
-        # Se é claramente NFC-e e não achou nenhum item, não inventa "Compra 127.06"
+        # Se é claramente NFC-e, não aplica fallback agressivo
         if is_nfce:
             if not itens:
                 logger.warning("  NFC-e detectada mas nenhum item foi reconhecido.")
@@ -319,7 +362,7 @@ class OCREngine:
 
         if total_valor is None:
             logger.warning("  Fallback: não foi possível determinar TOTAL de forma segura.")
-            return itens  # deixa vazio em vez de inventar
+            return itens
 
         itens.append({
             "item": "Compra",
