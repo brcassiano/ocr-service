@@ -9,7 +9,7 @@ import logging
 from .utils import TextProcessor
 
 print("=" * 80)
-print(">>> OCR_ENGINE.PY CARREGADO (VERSÃO NFC-e FIX) <<<")
+print(">>> OCR_ENGINE.PY CARREGADO (VERSÃO NFC-e FIX + DEBUG) <<<")
 print("=" * 80)
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class OCREngine:
 
     def __init__(self, use_gpu: bool = False):
         logger.info("=" * 60)
-        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO NFC-e FIX")
+        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO NFC-e FIX + DEBUG")
         logger.info("=" * 60)
 
         try:
@@ -80,7 +80,7 @@ class OCREngine:
             return None
 
         except Exception as e:
-            # o warning do zbar sobre databar é conhecido e pode ser ignorado [web:65]
+            # warning do zbar sobre databar é conhecido e pode ser ignorado [web:65]
             logger.error(f"✗ Erro ao extrair QR Code: {e}")
             return None
 
@@ -122,6 +122,13 @@ class OCREngine:
 
             lines.sort(key=lambda x: x['y_position'])
             logger.info(f"✓ OCR concluído: {len(lines)} linhas extraídas")
+
+            # DEBUG: imprimir todas as linhas que o PaddleOCR leu
+            print("=== DEBUG OCR LINES ===")
+            for i, l in enumerate(lines, 1):
+                print(f"{i:02d}: [{l['confidence']}] {l['text']}")
+            print("=== FIM DEBUG OCR LINES ===")
+
             return lines
 
         except Exception as e:
@@ -145,6 +152,12 @@ class OCREngine:
             }
 
         full_text = '\n'.join([line['text'] for line in ocr_lines])
+
+        # DEBUG: texto completo plano
+        print("=== DEBUG TEXTO COMPLETO ===")
+        print(full_text)
+        print("=== FIM DEBUG TEXTO COMPLETO ===")
+
         logger.info(f"=== TEXTO COMPLETO ({len(ocr_lines)} linhas) ===")
         for idx, line in enumerate(ocr_lines[:15], 1):
             logger.info(f"  {idx}. {line['text']}")
@@ -208,11 +221,12 @@ class OCREngine:
             raw = line['text']
             text = " ".join(raw.split())  # normaliza espaços
 
-            m = re.match(r'^(\d{1,2})\s+(\d{5,})\s+(.+)$', text)
+            # Mais permissivo: exige só que comece com número da linha
+            m = re.match(r'^(\d{1,2})\s+(.+)$', text)
             if not m:
                 continue
 
-            resto = m.group(3)  # produto + quantidade + valores
+            resto = m.group(2)  # produto + quantidade + valores
             logger.info(f"  Linha NFC-e detectada: {text}")
 
             # valores monetários na linha
@@ -224,17 +238,22 @@ class OCREngine:
             valor_total = float(valores[-1].replace(',', '.'))
             valor_unit = float(valores[-2].replace(',', '.')) if len(valores) >= 2 else valor_total
 
-            # quantidade (antes de UN/KG/LT)
+            # quantidade (antes de UN/KG/LT/L)
             m_qtd = re.search(r'(\d+)\s*(?:UN|KG|LT|L)\b', resto, re.IGNORECASE)
             qtd = float(m_qtd.group(1)) if m_qtd else 1.0
 
-            # nome do produto: tudo antes de " <qtd> UN x"
+            # nome do produto
             nome = resto
             if m_qtd:
                 # remove trecho "1 UN x 8,48 F 8,48" ou parecido
-                nome = re.sub(r'\s+\d+\s*(?:UN|KG|LT|L)\s*x\s*[\d.,]+.*$', '', nome, flags=re.IGNORECASE)
+                nome = re.sub(
+                    r'\s+\d+\s*(?:UN|KG|LT|L)\s*x\s*[\d.,]+.*$',
+                    '',
+                    nome,
+                    flags=re.IGNORECASE
+                )
             else:
-                # fallback: remove todos números/valores e unidades do final
+                # fallback: remove valores e unidades
                 nome = re.sub(r'\d+[.,]\d{2}', '', nome)
                 nome = re.sub(r'\d+\s*(?:UN|KG|LT|L)', '', nome, flags=re.IGNORECASE)
 
@@ -289,7 +308,6 @@ class OCREngine:
                 break
 
         if total_valor is None:
-            # último recurso: não usar maior valor aleatório para evitar casos como 127.06
             logger.warning("  Fallback: não foi possível determinar TOTAL de forma segura.")
             return itens  # deixa vazio em vez de inventar
 
