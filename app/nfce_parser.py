@@ -2,49 +2,54 @@ import re
 from bs4 import BeautifulSoup
 from typing import Dict, List, Optional
 import logging
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright  # MUDANÇA IMPORTANTE
 
 logger = logging.getLogger(__name__)
 
 class NfceParserSP:
     """
-    Parser usando Playwright (navegador real) para renderizar o JS da SEFAZ-SP.
+    Parser usando Playwright Async para renderizar JS da SEFAZ-SP.
     """
 
-    def fetch_html_dynamic(self, url: str) -> str:
+    # Agora o método é async
+    async def fetch_html_dynamic(self, url: str) -> str:
         url_clean = url.split('|')[0] if '|' in url else url
-        logger.info(f"Abrindo navegador para: {url_clean[:60]}...")
+        logger.info(f"Abrindo navegador (Async) para: {url_clean[:60]}...")
         
         try:
-            with sync_playwright() as p:
-                # Lança navegador Chromium headless (invisível)
-                browser = p.chromium.launch(headless=True, args=['--no-sandbox'])
-                page = browser.new_page()
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+                # Cria contexto com User-Agent real para evitar detecção simples
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                page = await context.new_page()
                 
-                # Acessa URL
-                page.goto(url_clean, timeout=30000, wait_until="domcontentloaded")
-                
-                # Espera a tabela de itens aparecer (timeout 10s)
-                # O ID da tabela em SP costuma ser 'tabResult' ou '#conteudo'
                 try:
-                    page.wait_for_selector("table", timeout=10000)
-                except:
-                    logger.warning("Timeout esperando tabela. Tentando ler o que carregou...")
+                    # Acessa URL
+                    await page.goto(url_clean, timeout=30000, wait_until="domcontentloaded")
+                    
+                    # Espera tabela aparecer
+                    try:
+                        await page.wait_for_selector("table", timeout=10000)
+                    except:
+                        logger.warning("Timeout esperando tabela. Tentando ler o que carregou...")
 
-                html = page.content()
-                browser.close()
+                    html = await page.content()
+                finally:
+                    await browser.close()
+                
                 return html
                 
         except Exception as e:
             logger.error(f"Erro no navegador Playwright: {e}")
             raise
 
-    def parse(self, url: str) -> Dict:
-        # Usa o método dinâmico em vez de requests simples
-        html = self.fetch_html_dynamic(url)
+    # O método parse agora também precisa ser async
+    async def parse(self, url: str) -> Dict:
+        html = await self.fetch_html_dynamic(url)
         soup = BeautifulSoup(html, "html.parser")
 
-        # Verifica erro de carregamento
         if "sessão expirou" in html.lower():
             logger.warning("SEFAZ: Sessão expirou.")
 
@@ -60,8 +65,7 @@ class NfceParserSP:
             "origem": "nfce_sp_browser",
         }
 
-    # --- MÉTODOS DE EXTRAÇÃO (IGUAIS AO ANTERIOR, POIS O HTML FINAL É O MESMO) ---
-
+    # --- MÉTODOS DE EXTRAÇÃO (SÍNCRONOS/COMUNS) ---
     def _extract_date(self, soup: BeautifulSoup) -> Optional[str]:
         for strong in soup.find_all("strong"):
             if "Emissão" in strong.get_text():
@@ -74,14 +78,12 @@ class NfceParserSP:
 
     def _extract_items_sp(self, soup: BeautifulSoup, data_compra: Optional[str]) -> List[Dict]:
         itens = []
-        # Tenta achar linhas por ID (padrão SP) ou todas as TRs de tabelas
         rows = soup.find_all("tr", id=re.compile(r"Item"))
         if not rows:
             table = soup.find("table", {"id": "tabResult"})
             if table: rows = table.find_all("tr")
 
         for row in rows:
-            # Nome
             nome_elem = row.find(class_="txtTit") or row.find(class_="fixo-prod-serv-descricao")
             if not nome_elem: continue
             nome = nome_elem.get_text(strip=True)
@@ -89,17 +91,14 @@ class NfceParserSP:
 
             text_row = row.get_text(" ", strip=True)
             
-            # Qtd
             qtd = 1.0
             m_qtd = re.search(r'Qtde\.?[:\s]*([0-9,.]+)', text_row, re.IGNORECASE)
             if m_qtd: qtd = float(m_qtd.group(1).replace(',', '.'))
             
-            # Unitário
             valor_unit = None
             m_unit = re.search(r'Unit\.?[:\s]*([0-9,.]+)', text_row, re.IGNORECASE)
             if m_unit: valor_unit = float(m_unit.group(1).replace(',', '.'))
 
-            # Total
             valor_total = None
             val_elem = row.find(class_="valor")
             if val_elem:

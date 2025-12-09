@@ -179,7 +179,7 @@ async def nfce_from_image(file: UploadFile = File(...)):
         logger.info(f"QR Code URL extraída: {qr_url[:120]}...")
 
         # 2) NFC-e via web scraping / parser [web:106][web:109]
-        nfce_data = nfce_parser.parse(qr_url)
+        nfce_data = await nfce_parser.parse(qr_url)
 
         response = {
             "tipo_documento": nfce_data.get("tipo_documento", "gasto"),
@@ -215,7 +215,7 @@ class NfceUrlRequest(BaseModel):
 async def nfce_from_url(body: NfceUrlRequest):
     """Recebe a URL pública da NFC-e (do QR Code) e retorna itens estruturados."""
     try:
-        nfce_data = nfce_parser.parse(body.url)
+        nfce_data = await nfce_parser.parse(body.url)
         response = {
             "tipo_documento": nfce_data.get("tipo_documento", "gasto"),
             "itens": nfce_data.get("itens", []),

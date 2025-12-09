@@ -254,9 +254,8 @@ class OCREngine:
             else:
                 end_idx = min(start_idx + 3, len(lines) - 1)  # limite de 3 linhas por item
 
-            # Garante que não invadimos áreas que não são de itens (ex: linha de "TOTAL", "QTD TOTAL")
-            # Se encontrarmos "QTD. TOTAL" ou "VALOR TOTAL" dentro do bloco, cortamos antes.
-            final_end_idx = end_idx  # Inicializa com o end_idx calculado
+            # Garante que não invadimos áreas que não são de itens
+            final_end_idx = end_idx
             for k in range(start_idx, end_idx + 1):
                 txt_lower = lines[k]['text'].lower()
                 if "qtd" in txt_lower and "total" in txt_lower:
@@ -280,22 +279,21 @@ class OCREngine:
             logger.info(f"  Bloco {i+1} (linhas {start_idx}-{final_end_idx}): {full_block_text}")
 
             # --- A) Nome do Produto ---
-            # Remove o código inicial (ex: "01 123456789")
+            # Remove o código inicial
             nome_sujo = re.sub(r'^(?:\d{1,2}|C\d)\s+\d+\s+', '', header_line_text)
             
-            # Limpeza extra no nome: remove sufixos de unidade se estiverem colados
+            # Limpeza extra no nome
             nome_limpo = re.sub(r'\s+(KG|UN|LT|L|PC)\s*$', '', nome_sujo, flags=re.IGNORECASE)
             
-            # Remove lixo de OCR no final do nome se houver (ex: "... MEG8 UN '1 UN ...")
-            match_lixo = re.search(r'\s+\d+\s*(UN|KG|L|LT)\s*[xX]', nome_limpo, re.IGNORECASE)
+            # Regex de Lixo (corrigido)
+            match_lixo = re.search(r'\s+[\d\.\,]*\s*(UN|KG|L|LT|PC).*?[xX]', nome_limpo, re.IGNORECASE)
             if match_lixo:
                 nome_limpo = nome_limpo[:match_lixo.start()]
 
-            nome = nome_limpo.strip(" -.'")
+            nome = nome_limpo.strip(" -.'\"")
             if len(nome) < 3: nome = "Produto"
 
             # --- B) Valores (Unitário, Total) e Quantidade ---
-            # 1. Padrão explicito: "0,116 KG x 94,99"
             pattern_full = r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|LT|L|PC)\s*[xX]\s*([0-9]+[.,][0-9]{2})'
             match_full = re.search(pattern_full, full_block_text, re.IGNORECASE)
             
@@ -309,7 +307,6 @@ class OCREngine:
                 except:
                     pass
             else:
-                # Se não achou "x valor", tenta achar só quantidade isolada "3 UN"
                 match_qtd = re.search(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|LT|L|PC)\b', full_block_text, re.IGNORECASE)
                 if match_qtd:
                     try:
@@ -333,15 +330,9 @@ class OCREngine:
             if valores_float:
                 if valor_unit is not None:
                     esperado = qtd * valor_unit
-                    # Pega o valor mais próximo do esperado
                     valor_total = min(valores_float, key=lambda x: abs(x - esperado))
                 else:
-                    # Se não temos unitário, o total geralmente é o maior ou último valor do bloco
-                    valor_total = valores_float[-1]
-
-            # Correção final: Se o total for igual ao unitário e qtd > 1, algo deu errado? 
-            if valor_unit and valor_total and valor_total < valor_unit and qtd > 1:
-                pass 
+                    valor_total = max(valores_float)
 
             # Validacao basica
             if valor_total is None and valor_unit:
@@ -366,7 +357,7 @@ class OCREngine:
             return itens
         
         # ------------------------------------------------------------------
-        # Fallback MUITO conservador para outros tipos de comprovante
+        # Fallback conservador
         # ------------------------------------------------------------------
         all_valores = []
         for line in lines:
