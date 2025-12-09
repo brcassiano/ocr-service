@@ -42,8 +42,8 @@ class OCREngine:
     # -------------------------------------------------------------------------
     # QR CODE
     # -------------------------------------------------------------------------
-    def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
-        """Extrai QR Code com múltiplas tentativas."""
+        def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
+        """Extrai QR Code com múltiplas tentativas (pyzbar + OpenCV fallback)."""
         try:
             logger.info("→ Tentando extrair QR Code...")
             nparr = np.frombuffer(image_bytes, np.uint8)
@@ -56,15 +56,20 @@ class OCREngine:
             logger.info(f"  Imagem: {img.shape[1]}x{img.shape[0]} pixels")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+            # -------- 1) TENTATIVAS COM PYZBAR --------
             attempts = [
                 ("grayscale normal", gray),
-                ("threshold binário", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
-                ("CLAHE contraste", cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)),
-                ("resize 2x", cv2.resize(gray, (gray.shape[1]*2, gray.shape[0]*2), interpolation=cv2.INTER_CUBIC))
+                ("threshold binário", cv2.threshold(gray, 0, 255,
+                                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+                ("CLAHE contraste", cv2.createCLAHE(clipLimit=3.0,
+                                                    tileGridSize=(8, 8)).apply(gray)),
+                ("resize 2x", cv2.resize(gray,
+                                         (gray.shape[1] * 2, gray.shape[0] * 2),
+                                         interpolation=cv2.INTER_CUBIC))
             ]
 
             for method, processed_img in attempts:
-                logger.info(f"  Tentativa: {method}")
+                logger.info(f"  Tentativa (pyzbar): {method}")
                 decoded = decode(processed_img)
                 if decoded:
                     results = []
@@ -72,22 +77,29 @@ class OCREngine:
                         if obj.type == 'QRCODE':
                             data = obj.data.decode('utf-8', errors='ignore')
                             results.append({'data': data, 'type': obj.type})
-                            logger.info(f"  ✓ QR Code encontrado: {data[:80]}...")
+                            logger.info(f"  ✓ QR Code encontrado (pyzbar): {data[:80]}...")
                     if results:
                         return results
 
-            logger.warning("✗ QR Code não detectado após 4 tentativas")
+            # -------- 2) FALLBACK COM OPENCV QRCodeDetector --------
+            logger.info("  Pyzbar não encontrou nada, tentando OpenCV QRCodeDetector...")
+            detector = cv2.QRCodeDetector()
+            data, points, _ = detector.detectAndDecode(img)
+            if data:
+                logger.info(f"  ✓ QR Code encontrado (OpenCV): {data[:80]}...")
+                return [{'data': data, 'type': 'QRCODE'}]
+
+            logger.warning("✗ QR Code não detectado (pyzbar nem OpenCV)")
             return None
 
         except Exception as e:
-            # warning do zbar sobre databar é conhecido e pode ser ignorado [web:65]
             logger.error(f"✗ Erro ao extrair QR Code: {e}")
             return None
 
     # -------------------------------------------------------------------------
     # OCR TEXTO
     # -------------------------------------------------------------------------
-    def extract_text(self, image_bytes: bytes) -> List[Dict]:
+    def extract_text(self, image_bytes: bytes) -> List[Dict]]:
         """Executa OCR e retorna lista de linhas (texto, confiança, posição)."""
         try:
             logger.info("→ Executando OCR...")
@@ -138,7 +150,7 @@ class OCREngine:
     # -------------------------------------------------------------------------
     # ESTRUTURAÇÃO
     # -------------------------------------------------------------------------
-    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
+    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict]:
         """Monta o JSON final a partir das linhas OCR + QRCode."""
         logger.info("→ Estruturando dados...")
 
@@ -217,7 +229,7 @@ class OCREngine:
         itens: List[Dict] = []
 
         # -------- NFC-e: linhas começando com 01 / 02 / 03 etc --------
-            for line in lines:
+        for line in lines:
             raw = line['text']
             text = " ".join(raw.split())  # normaliza espaços
 
@@ -284,7 +296,6 @@ class OCREngine:
         all_valores = []
         for line in lines:
             t = line['text']
-            # ignora linhas de tributos/impostos
             if re.search(r'trib\.?|fed:?|est:?|mun:?', t, re.IGNORECASE):
                 continue
             valores_linha = re.findall(r'(\d+[.,]\d{2})', t)
@@ -299,7 +310,6 @@ class OCREngine:
         if not all_valores:
             return itens  # vazio
 
-        # tentar pegar linha de TOTAL
         total_valor = None
         for v, t in all_valores:
             if re.search(r'valor\s+total|total\s*\(r?\$\)|pix', t, re.IGNORECASE):
