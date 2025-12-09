@@ -15,3 +15,7 @@ pyzbar==0.1.9
 # Validação e utilitários
 pydantic==2.9.2
 pydantic-settings==2.6.0
+
+requests
+beautifulsoup4
+lxml
