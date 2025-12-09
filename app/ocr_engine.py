@@ -42,7 +42,7 @@ class OCREngine:
     # -------------------------------------------------------------------------
     # QR CODE
     # -------------------------------------------------------------------------
-        def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
+    def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
         """Extrai QR Code com múltiplas tentativas (pyzbar + OpenCV fallback)."""
         try:
             logger.info("→ Tentando extrair QR Code...")
@@ -99,7 +99,7 @@ class OCREngine:
     # -------------------------------------------------------------------------
     # OCR TEXTO
     # -------------------------------------------------------------------------
-    def extract_text(self, image_bytes: bytes) -> List[Dict]]:
+    def extract_text(self, image_bytes: bytes) -> List[Dict]:
         """Executa OCR e retorna lista de linhas (texto, confiança, posição)."""
         try:
             logger.info("→ Executando OCR...")
@@ -150,7 +150,7 @@ class OCREngine:
     # -------------------------------------------------------------------------
     # ESTRUTURAÇÃO
     # -------------------------------------------------------------------------
-    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict]:
+    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
         """Monta o JSON final a partir das linhas OCR + QRCode."""
         logger.info("→ Estruturando dados...")
 
