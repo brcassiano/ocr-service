@@ -217,7 +217,7 @@ class OCREngine:
         itens: List[Dict] = []
 
         # -------- NFC-e: linhas começando com 01 / 02 / 03 etc --------
-                for line in lines:
+            for line in lines:
             raw = line['text']
             text = " ".join(raw.split())  # normaliza espaços
 
