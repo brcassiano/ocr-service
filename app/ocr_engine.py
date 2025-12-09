@@ -8,35 +8,26 @@ from typing import List, Dict, Optional
 import logging
 from .utils import TextProcessor
 
-# PRINT PARA FORÇAR DETECÇÃO DE CÓDIGO NOVO
 print("=" * 80)
-print(">>> OCR_ENGINE.PY VERSÃO NOVA CARREGADA - TIMESTAMP: 2025-12-08-02:45 <<<")
+print(">>> OCR_ENGINE.PY CARREGADO (VERSÃO NFC-e FIX) <<<")
 print("=" * 80)
 
 logger = logging.getLogger(__name__)
 
+
 class OCREngine:
-    """Motor OCR com extração permissiva e logs detalhados"""
-    
+    """Motor OCR focado em cupons fiscais/NFC-e brasileiros."""
+
     KEYWORDS_VENDA = ['recebido', 'pix recebido', 'crédito em conta', 'depósito', 'recibo']
 
     def __init__(self, use_gpu: bool = False):
-        print(">>> DENTRO DO __INIT__ DO OCR ENGINE <<<")  # Print adicional
         logger.info("=" * 60)
-        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO NOVA COM LOGS DETALHADOS")
+        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO NFC-e FIX")
         logger.info("=" * 60)
-    
-    KEYWORDS_VENDA = ['recebido', 'pix recebido', 'crédito em conta', 'depósito', 'recibo']
 
-    def __init__(self, use_gpu: bool = False):
-        # LOG PARA VERIFICAR QUAL CÓDIGO ESTÁ RODANDO
-        logger.info("=" * 60)
-        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO NOVA COM LOGS DETALHADOS")
-        logger.info("=" * 60)
-        
         try:
             self.ocr = PaddleOCR(
-                use_angle_cls=False,
+                use_angle_cls=False,   # evita baixar modelo cls extra
                 lang='pt',
                 use_gpu=use_gpu,
                 show_log=False
@@ -45,31 +36,33 @@ class OCREngine:
         except Exception as e:
             logger.error(f"✗ Erro ao inicializar OCR: {e}")
             raise
-        
+
         self.text_processor = TextProcessor()
-    
+
+    # -------------------------------------------------------------------------
+    # QR CODE
+    # -------------------------------------------------------------------------
     def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
-        """Extrai QR Code com 4 tentativas"""
+        """Extrai QR Code com múltiplas tentativas."""
         try:
             logger.info("→ Tentando extrair QR Code...")
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
+
             if img is None:
                 logger.error("✗ Falha ao decodificar imagem")
                 return None
-            
+
             logger.info(f"  Imagem: {img.shape[1]}x{img.shape[0]} pixels")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            # 4 tentativas
+
             attempts = [
                 ("grayscale normal", gray),
                 ("threshold binário", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
-                ("CLAHE contraste", cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(gray)),
+                ("CLAHE contraste", cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)),
                 ("resize 2x", cv2.resize(gray, (gray.shape[1]*2, gray.shape[0]*2), interpolation=cv2.INTER_CUBIC))
             ]
-            
+
             for method, processed_img in attempts:
                 logger.info(f"  Tentativa: {method}")
                 decoded = decode(processed_img)
@@ -80,41 +73,45 @@ class OCREngine:
                             data = obj.data.decode('utf-8', errors='ignore')
                             results.append({'data': data, 'type': obj.type})
                             logger.info(f"  ✓ QR Code encontrado: {data[:80]}...")
-                            return results
-            
+                    if results:
+                        return results
+
             logger.warning("✗ QR Code não detectado após 4 tentativas")
             return None
-            
+
         except Exception as e:
+            # o warning do zbar sobre databar é conhecido e pode ser ignorado [web:65]
             logger.error(f"✗ Erro ao extrair QR Code: {e}")
             return None
-    
+
+    # -------------------------------------------------------------------------
+    # OCR TEXTO
+    # -------------------------------------------------------------------------
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
-        """OCR completo"""
+        """Executa OCR e retorna lista de linhas (texto, confiança, posição)."""
         try:
             logger.info("→ Executando OCR...")
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
+
             if img is None:
                 logger.error("✗ Falha ao decodificar imagem")
                 return []
-            
-            # Pré-processar
+
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             denoised = cv2.fastNlMeansDenoising(gray, h=10)
-            
+
             result = self.ocr.ocr(denoised, cls=True)
-            
+
             if not result or not result[0]:
                 logger.warning("✗ OCR não retornou resultados")
                 return []
-            
+
             lines = []
             for line in result[0]:
                 text = line[1][0].strip()
                 confidence = line[1][1]
-                
+
                 if confidence > 0.4:
                     lines.append({
                         'text': text,
@@ -122,20 +119,22 @@ class OCREngine:
                         'y_position': int(line[0][0][1])
                     })
                     logger.info(f"  [{confidence:.0%}] {text}")
-            
+
             lines.sort(key=lambda x: x['y_position'])
             logger.info(f"✓ OCR concluído: {len(lines)} linhas extraídas")
-            
             return lines
-            
+
         except Exception as e:
             logger.error(f"✗ Erro no OCR: {e}")
             return []
-    
+
+    # -------------------------------------------------------------------------
+    # ESTRUTURAÇÃO
+    # -------------------------------------------------------------------------
     def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
-        """Estrutura dados"""
+        """Monta o JSON final a partir das linhas OCR + QRCode."""
         logger.info("→ Estruturando dados...")
-        
+
         if not ocr_lines:
             return {
                 "tipo_documento": "erro",
@@ -144,31 +143,31 @@ class OCREngine:
                 "mensagem": "Não consegui extrair texto.",
                 "confianca": 0.0
             }
-        
+
         full_text = '\n'.join([line['text'] for line in ocr_lines])
         logger.info(f"=== TEXTO COMPLETO ({len(ocr_lines)} linhas) ===")
         for idx, line in enumerate(ocr_lines[:15], 1):
             logger.info(f"  {idx}. {line['text']}")
         logger.info("=== FIM TEXTO ===")
-        
+
         tipo = self._detect_type(full_text)
         logger.info(f"  Tipo detectado: {tipo}")
-        
-        itens = self._extract_items_permissive(ocr_lines, full_text, tipo)
+
+        itens = self._extract_items_nfe_first(ocr_lines, full_text, tipo)
         qr_url = qr_data[0]['data'] if qr_data else None
-        
+
         avg_conf = sum(l['confidence'] for l in ocr_lines) / len(ocr_lines)
-        
+
         if not itens:
             logger.error("✗ Nenhum item extraído!")
             return {
                 "tipo_documento": "erro",
                 "itens": [],
                 "qrcode_url": qr_url,
-                "mensagem": "Consegui ler mas não encontrei valores. Tente foto mais nítida.",
+                "mensagem": "Consegui ler mas não encontrei itens válidos.",
                 "confianca": round(avg_conf, 3)
             }
-        
+
         logger.info(f"✓ {len(itens)} itens extraídos com sucesso")
         return {
             "tipo_documento": tipo,
@@ -177,139 +176,148 @@ class OCREngine:
             "mensagem": None,
             "confianca": round(avg_conf, 3)
         }
-    
+
+    # -------------------------------------------------------------------------
+    # HELPERS
+    # -------------------------------------------------------------------------
     def _detect_type(self, text: str) -> str:
-        """Detecta tipo"""
+        """Detecta se é venda (recebido) ou gasto (compra)."""
         text_lower = text.lower()
         for kw in self.KEYWORDS_VENDA:
             if kw in text_lower:
                 logger.info(f"  Keyword venda: '{kw}'")
                 return 'venda'
         return 'gasto'
-    
-    def _extract_items_permissive(self, lines: List[Dict], full_text: str, tipo: str) -> List[Dict]:
-        """Extração permissiva"""
-        logger.info("→ Extraindo itens (modo permissivo)...")
-        
-        # 1. BUSCAR DATA
+
+    def _extract_items_nfe_first(self, lines: List[Dict], full_text: str, tipo: str) -> List[Dict]:
+        """
+        1º tenta extrair itens no padrão NFC-e (linhas 01/02/...).
+        Se falhar e não for NFC-e, faz um fallback bem conservador.
+        """
+        logger.info("→ Extraindo itens (priorizando NFC-e)...")
+
         data_compra = self._extract_date(full_text)
-        logger.info(f"  Data: {data_compra}")
-        
-        # 2. EXTRAIR VALORES
+        logger.info(f"  Data detectada: {data_compra}")
+
+        is_nfce = "DOCUMENTO AUXILIAR DA NOTA FISCAL DE CONSUMIDOR" in full_text.upper()
+
+        itens: List[Dict] = []
+
+        # -------- NFC-e: linhas começando com 01 / 02 / 03 etc --------
+        for line in lines:
+            raw = line['text']
+            text = " ".join(raw.split())  # normaliza espaços
+
+            m = re.match(r'^(\d{1,2})\s+(\d{5,})\s+(.+)$', text)
+            if not m:
+                continue
+
+            resto = m.group(3)  # produto + quantidade + valores
+            logger.info(f"  Linha NFC-e detectada: {text}")
+
+            # valores monetários na linha
+            valores = re.findall(r'(\d+[.,]\d{2})', resto)
+            if not valores:
+                logger.info("    Nenhum valor encontrado nesta linha, pulando.")
+                continue
+
+            valor_total = float(valores[-1].replace(',', '.'))
+            valor_unit = float(valores[-2].replace(',', '.')) if len(valores) >= 2 else valor_total
+
+            # quantidade (antes de UN/KG/LT)
+            m_qtd = re.search(r'(\d+)\s*(?:UN|KG|LT|L)\b', resto, re.IGNORECASE)
+            qtd = float(m_qtd.group(1)) if m_qtd else 1.0
+
+            # nome do produto: tudo antes de " <qtd> UN x"
+            nome = resto
+            if m_qtd:
+                # remove trecho "1 UN x 8,48 F 8,48" ou parecido
+                nome = re.sub(r'\s+\d+\s*(?:UN|KG|LT|L)\s*x\s*[\d.,]+.*$', '', nome, flags=re.IGNORECASE)
+            else:
+                # fallback: remove todos números/valores e unidades do final
+                nome = re.sub(r'\d+[.,]\d{2}', '', nome)
+                nome = re.sub(r'\d+\s*(?:UN|KG|LT|L)', '', nome, flags=re.IGNORECASE)
+
+            nome = nome.strip(" -")
+            if len(nome) < 3:
+                nome = "Produto"
+
+            logger.info(f"    ✓ Item NFC-e: nome='{nome}', qtd={qtd}, unit={valor_unit}, total={valor_total}")
+
+            itens.append({
+                "item": nome,
+                "quantidade": qtd,
+                "valor_unitario": round(valor_unit, 2),
+                "valor_total": round(valor_total, 2),
+                "data_compra": data_compra if tipo == 'gasto' else None,
+                "data_venda": data_compra if tipo == 'venda' else None,
+            })
+
+        # Se é claramente NFC-e e não achou nenhum item, não inventa "Compra 127.06"
+        if is_nfce:
+            if not itens:
+                logger.warning("  NFC-e detectada mas nenhum item foi reconhecido.")
+            return itens
+
+        # ------------------------------------------------------------------
+        # Fallback MUITO conservador para outros tipos de comprovante
+        # ------------------------------------------------------------------
         all_valores = []
         for line in lines:
-            valores_linha = re.findall(r'(\d+[.,]\d{2})', line['text'])
+            t = line['text']
+            # ignora linhas de tributos/impostos
+            if re.search(r'trib\.?|fed:?|est:?|mun:?', t, re.IGNORECASE):
+                continue
+            valores_linha = re.findall(r'(\d+[.,]\d{2})', t)
             for val in valores_linha:
                 try:
-                    val_float = float(val.replace(',', '.'))
-                    if 0.01 <= val_float <= 999999:
-                        all_valores.append({
-                            'valor': val_float,
-                            'linha': line['text']
-                        })
-                        logger.info(f"  Valor: R$ {val_float:.2f} em '{line['text'][:60]}'")
-                except:
+                    v = float(val.replace(',', '.'))
+                    if 0.01 <= v <= 999999:
+                        all_valores.append((v, t))
+                except ValueError:
                     pass
-        
+
         if not all_valores:
-            logger.error("✗ Nenhum valor monetário encontrado!")
-            return []
-        
-        logger.info(f"  Total de valores encontrados: {len(all_valores)}")
-        
-        # 3. VENDAS
-        if tipo == 'venda':
-            maior = max(all_valores, key=lambda x: x['valor'])
-            logger.info(f"  Venda: R$ {maior['valor']:.2f}")
-            return [{
-                "item": None,
-                "quantidade": None,
-                "valor_unitario": None,
-                "valor_total": maior['valor'],
-                "data_venda": data_compra
-            }]
-        
-        # 4. GASTOS - Estratégia 1: Linhas NFC-e
-        itens = []
-        for line in lines:
-            text = line['text']
-            
-            # Formato: 01 CODIGO_LONGO PRODUTO VALORES
-            if re.match(r'^\d{2}\s+\d{8,}', text):
-                valores_linha = re.findall(r'(\d+[.,]\d{2})', text)
-                if valores_linha:
-                    nome = self._extract_product_name(text)
-                    qtd = self._extract_quantity(text)
-                    
-                    valor_total = float(valores_linha[-1].replace(',', '.'))
-                    valor_unit = float(valores_linha[-2].replace(',', '.')) if len(valores_linha) >= 2 else valor_total
-                    
-                    itens.append({
-                        "item": nome,
-                        "quantidade": qtd,
-                        "valor_unitario": round(valor_unit, 2),
-                        "valor_total": round(valor_total, 2),
-                        "data_compra": data_compra
-                    })
-                    logger.info(f"  ✓ Item NFC-e: {nome} - R$ {valor_total:.2f}")
-        
-        # Estratégia 2: Buscar TOTAL
-        if not itens:
-            logger.info("  Fallback: buscando linha TOTAL...")
-            total_valor = None
-            
-            for line in lines:
-                if re.search(r'(total|pix)\s*\(?r?\$?\)?\s*(\d+[.,]\d{2})', line['text'], re.IGNORECASE):
-                    match = re.search(r'(\d+[.,]\d{2})', line['text'])
-                    if match:
-                        total_valor = float(match.group(1).replace(',', '.'))
-                        logger.info(f"  ✓ Total: R$ {total_valor:.2f}")
-                        break
-            
-            if not total_valor:
-                total_valor = max([v['valor'] for v in all_valores])
-                logger.info(f"  Usando maior valor: R$ {total_valor:.2f}")
-            
-            itens.append({
-                "item": "Compra",
-                "quantidade": 1,
-                "valor_unitario": total_valor,
-                "valor_total": total_valor,
-                "data_compra": data_compra
-            })
-        
+            return itens  # vazio
+
+        # tentar pegar linha de TOTAL
+        total_valor = None
+        for v, t in all_valores:
+            if re.search(r'valor\s+total|total\s*\(r?\$\)|pix', t, re.IGNORECASE):
+                total_valor = v
+                logger.info(f"  Fallback: total encontrado em linha '{t}' -> {v}")
+                break
+
+        if total_valor is None:
+            # último recurso: não usar maior valor aleatório para evitar casos como 127.06
+            logger.warning("  Fallback: não foi possível determinar TOTAL de forma segura.")
+            return itens  # deixa vazio em vez de inventar
+
+        itens.append({
+            "item": "Compra",
+            "quantidade": 1,
+            "valor_unitario": total_valor,
+            "valor_total": total_valor,
+            "data_compra": data_compra if tipo == 'gasto' else None,
+            "data_venda": data_compra if tipo == 'venda' else None,
+        })
         return itens
-    
+
     def _extract_date(self, text: str) -> str:
-        """Extrai data"""
+        """Extrai data preferindo Emissão/Emissao; fallback para qualquer DD/MM/AAAA."""
         patterns = [
-            r'emiss[aã]o[:\s]*(\d{2}[/-]\d{2}[/-]\d{4})',
-            r'data[:\s]*(\d{2}[/-]\d{2}[/-]\d{4})',
+            r'emiss[aã]o[:\s]*(\d{2}/\d{2}/\d{4})',
+            r'data[:\s]*(\d{2}/\d{2}/\d{4})',
             r'(\d{2}/\d{2}/\d{4})',
         ]
-        
+
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                date_str = match.group(1).replace('-', '/')
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                date_str = m.group(1)
                 logger.info(f"  Data encontrada: {date_str}")
                 return date_str
-        
+
         hoje = datetime.now().strftime('%d/%m/%Y')
         logger.warning(f"  Data não encontrada, usando hoje: {hoje}")
         return hoje
-    
-    def _extract_product_name(self, text: str) -> str:
-        """Extrai nome do produto"""
-        text = re.sub(r'^\d{2}\s+\d{8,}\s*', '', text)
-        text = re.sub(r'\d+[.,]\d{2}', '', text)
-        text = re.sub(r'\d+\s*(un|kg|lt|pc)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s+[a-z]\s+', ' ', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s+x\s+', ' ', text)
-        nome = text.strip()
-        return nome if len(nome) > 2 else "Produto"
-    
-    def _extract_quantity(self, text: str) -> float:
-        """Extrai quantidade"""
-        match = re.search(r'(\d+)\s*un', text, re.IGNORECASE)
-        return float(match.group(1)) if match else 1.0
