@@ -9,7 +9,7 @@ import logging
 from .utils import TextProcessor
 
 print("=" * 80)
-print(">>> OCR_ENGINE.PY CARREGADO (VERSÃO FINAL: FALLBACK INTELIGENTE) <<<")
+print(">>> OCR_ENGINE.PY CARREGADO (VERSÃO: CONFIANÇA MATEMÁTICA ABSOLUTA) <<<")
 print("=" * 80)
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class OCREngine:
             if img is None: return None
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
+            # Tenta várias técnicas de imagem para achar o QR
             for _, processed in [
                 ("gray", gray),
                 ("thresh", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
@@ -71,8 +72,7 @@ class OCREngine:
                     lines.append({'text': line[1][0].strip(), 'confidence': line[1][1], 'y_position': int(line[0][0][1])})
             lines.sort(key=lambda x: x['y_position'])
             
-            # LOG IMPORTANTE PARA DEBUG
-            logger.info("=== OCR LINES DEBUG ===")
+            logger.info(f"=== OCR LINES ({len(lines)}) ===")
             for i, l in enumerate(lines): logger.info(f"{i:02d}: {l['text']}")
             logger.info("=== FIM OCR LINES ===")
             
@@ -83,12 +83,12 @@ class OCREngine:
         full_text = '\n'.join([l['text'] for l in ocr_lines])
         tipo = 'venda' if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else 'gasto'
         
-        # Tenta estratégia principal
+        # 1. Tenta extração via cabeçalho (01 1234...)
         itens = self._extract_items_smart(ocr_lines, full_text, tipo)
         
-        # Se falhou, tenta estratégia de fallback (procura pelo 'x')
+        # 2. Se falhar, tenta extração via "X" (1 UN x 10,00)
         if not itens:
-            logger.warning("Estratégia principal (Códigos) falhou. Tentando Fallback (Multiplicação X)...")
+            logger.warning("Estratégia 1 falhou. Tentando Fallback 'X'...")
             itens = self._extract_items_fallback_x(ocr_lines, full_text, tipo)
 
         return {
@@ -103,76 +103,77 @@ class OCREngine:
         data_compra = self._extract_date(full_text)
         itens = []
         
-        # Regex mais permissivo (aceita sujeira no começo)
-        header_regex = re.compile(r'(?:^|\s)(?:\d{1,2}|C\d)\s+\d{4,}')
+        # Regex simplificado: Procura numeros no inicio da linha seguidos de espaço e mais numeros
+        header_regex = re.compile(r'(?:^|\s)(?:\d{1,3}|C\d)\s+\d+')
         header_indices = [i for i, l in enumerate(lines) if header_regex.search(" ".join(l['text'].split()))]
-
-        logger.info(f"Indices de cabeçalho encontrados: {header_indices}")
-
-        if not header_indices: return []
+        
+        logger.info(f"Indices Candidatos (Smart): {header_indices}")
 
         for i, idx in enumerate(header_indices):
+            # Expande a área de busca (1 pra trás, 6 pra frente) para garantir que pegamos tudo
             start_search = max(0, idx - 1)
-            end_search = header_indices[i+1] if i+1 < len(header_indices) else min(idx + 5, len(lines))
+            end_search = header_indices[i+1] if i+1 < len(header_indices) else min(idx + 6, len(lines))
             if i > 0 and start_search < header_indices[i-1]: start_search = header_indices[i-1] + 1
             
             search_lines = lines[start_search:end_search]
             block_text = " ".join([l['text'] for l in search_lines])
             
-            # Nome
+            # Limpa Nome
             header_text = " ".join(lines[idx]['text'].split())
-            nome = re.sub(r'^(?:\d{1,2}|C\d)\s+\d+\s+', '', header_text) # Remove codigo
-            nome = re.sub(r'\s+(KG|UN|LT|L)\s*$', '', nome, flags=re.IGNORECASE)
-            # Limpeza agressiva
-            match_lixo = re.search(r'\s+[\d\.\,]*\s*(UN|KG|L|LT).*?[xX]', nome, re.IGNORECASE)
+            nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', header_text) # Tira codigo
+            nome = re.sub(r'\s+(KG|UN|LT|L)\s*$', '', nome, flags=re.IGNORECASE) # Tira unidade fim
+            match_lixo = re.search(r'\s+[\d\.\,]*\s*(UN|KG|L|LT).*?[xX]', nome, re.IGNORECASE) # Tira lixo '1 UN x'
             if match_lixo: nome = nome[:match_lixo.start()]
             nome = nome.strip(" -.'\"") or "Produto"
 
-            item_dict = self._parse_block_values(block_text, nome, data_compra, tipo)
-            if item_dict: itens.append(item_dict)
+            item = self._parse_block_values(block_text, nome, data_compra, tipo)
+            if item: 
+                logger.info(f"  -> ITEM ENCONTRADO (Smart): {item['item']} | Tot: {item['valor_total']}")
+                itens.append(item)
+            else:
+                logger.warning(f"  -> Falha ao processar bloco: {nome}")
         
         return itens
 
     def _extract_items_fallback_x(self, lines: List[Dict], full_text: str, tipo: str) -> List[Dict]:
-        """Procura linhas que tenham padrão 'NUM UN x NUM'"""
         data_compra = self._extract_date(full_text)
         itens = []
         
-        # Regex para achar linha de quantidade: "0,116 KG x 94,99"
+        # Procura linhas com "NUM UN X NUM"
         x_regex = re.compile(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|L|LT|PC)\s*[xX]\s*([0-9]+[.,][0-9a-zA-Z]+)', re.IGNORECASE)
-        
         x_indices = [i for i, l in enumerate(lines) if x_regex.search(l['text'])]
-        logger.info(f"Indices com 'X' encontrados: {x_indices}")
         
+        logger.info(f"Indices Candidatos (Fallback X): {x_indices}")
+
         for idx in x_indices:
-            # O nome geralmente está na linha ANTERIOR ou na MESMA linha (antes do numero)
-            # Vamos pegar um bloco ao redor
+            # Pega contexto ao redor da linha do X
             start_search = max(0, idx - 1)
             end_search = min(idx + 2, len(lines))
-            search_lines = lines[start_search:end_search]
-            block_text = " ".join([l['text'] for l in search_lines])
+            block_text = " ".join([l['text'] for l in lines[start_search:end_search]])
 
-            # Tenta pegar o nome da linha anterior se existir
-            nome = "Produto Indefinido"
+            # Tenta achar nome na linha anterior
+            nome = "Produto"
             if idx > 0:
-                prev_line = lines[idx-1]['text']
-                # Se a linha anterior nao for outro 'x' nem data
-                if not x_regex.search(prev_line) and len(prev_line) > 3:
-                     # Remove códigos se tiver
-                    nome = re.sub(r'^(?:\d{1,2}|C\d)\s+\d+\s+', '', prev_line)
-                    nome = nome.strip(" -.'\"")
-            
-            item_dict = self._parse_block_values(block_text, nome, data_compra, tipo)
-            if item_dict: itens.append(item_dict)
+                prev = lines[idx-1]['text']
+                if not x_regex.search(prev) and len(prev) > 3:
+                     nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', prev).strip(" -.'\"")
+
+            item = self._parse_block_values(block_text, nome, data_compra, tipo)
+            if item: 
+                logger.info(f"  -> ITEM ENCONTRADO (Fallback): {item['item']} | Tot: {item['valor_total']}")
+                itens.append(item)
 
         return itens
 
     def _parse_block_values(self, block_text, nome, data_compra, tipo):
-        # Qtd/Unit
+        """Extrai valores do bloco de texto e aplica Confiança Matemática."""
         qtd = 1.0
         unit = None
+        
+        # Limpeza de OCR (ex: 19,9C -> 19,90)
         clean_block = block_text.replace('C', '0').replace('O', '0')
         
+        # Regex Qtd x Unit
         m_full = re.search(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|L|LT|PC)\s*[xX]\s*([0-9]+[.,][0-9]+)', clean_block, re.IGNORECASE)
         if m_full:
             try:
@@ -180,27 +181,30 @@ class OCREngine:
                 unit = float(m_full.group(2).replace(',', '.'))
             except: pass
         else:
-             # Tenta achar só QTD isolada se falhar o full
+             # Tenta achar QTD sozinha
             m_qtd = re.search(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|L|LT|PC)\b', clean_block, re.IGNORECASE)
             if m_qtd: 
                 try: qtd = float(m_qtd.group(1).replace(',', '.'))
                 except: pass
 
-        # Busca Totais
-        candidates = []
-        for val_str in re.findall(r'(\d+[.,]\d{2})', block_text):
-            try: candidates.append(float(val_str.replace(',', '.')))
-            except: pass
-        
         valor_total = None
+
+        # --- LÓGICA DE CONFIANÇA MATEMÁTICA ---
         if unit is not None:
-            expected = round(qtd * unit, 2)
-            matches = [c for c in candidates if abs(c - expected) <= 0.05]
-            valor_total = matches[0] if matches else expected
+            # Se temos Qtd e Unit, CALCULAMOS O TOTAL.
+            # Não dependemos de achá-lo no OCR. A matemática manda.
+            valor_total = round(qtd * unit, 2)
         else:
-            # Sem unitário, tenta achar candidato que nao seja a QTD
+            # Se não temos unitário, temos que caçar o total no texto
+            candidates = []
+            for val_str in re.findall(r'(\d+[.,]\d{2})', block_text):
+                try: candidates.append(float(val_str.replace(',', '.')))
+                except: pass
+            
+            # Pega o maior valor que não seja a própria quantidade
             valid_candidates = [c for c in candidates if abs(c - qtd) > 0.001]
-            if valid_candidates: valor_total = valid_candidates[-1]
+            if valid_candidates: 
+                valor_total = valid_candidates[-1]
 
         if valor_total is not None:
             return {
