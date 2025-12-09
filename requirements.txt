@@ -19,3 +19,4 @@ pydantic-settings==2.6.0
 requests
 beautifulsoup4
 lxml
+playwright

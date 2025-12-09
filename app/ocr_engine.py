@@ -9,7 +9,7 @@ import logging
 from .utils import TextProcessor
 
 print("=" * 80)
-print(">>> OCR_ENGINE.PY CARREGADO (VERSÃO NFC-e FIX + DEBUG) <<<")
+print(">>> OCR_ENGINE.PY CARREGADO (VERSÃO FINAL REFINADA) <<<")
 print("=" * 80)
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class OCREngine:
 
     def __init__(self, use_gpu: bool = False):
         logger.info("=" * 60)
-        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO NFC-e FIX + DEBUG")
+        logger.info("INICIALIZANDO OCR ENGINE - VERSÃO FINAL REFINADA")
         logger.info("=" * 60)
 
         try:
@@ -221,20 +221,20 @@ class OCREngine:
     def _extract_items_nfe_first(self, lines: List[Dict], full_text: str, tipo: str) -> List[Dict]:
         """
         1º tenta extrair itens no padrão NFC-e (linhas 01/02/C2/C3/...).
-        Agrupa por bloco de linhas de cada item.
-        Se falhar e não for NFC-e, faz um fallback bem conservador.
+        Lógica refinada para separar blocos e evitar mistura de valores entre itens vizinhos.
         """
         logger.info("→ Extraindo itens (priorizando NFC-e)...")
 
         data_compra = self._extract_date(full_text)
-        logger.info(f"  Data detectada: {data_compra}")
-
+        
+        # Detecta se é NFC-e pelo texto do cabeçalho
         is_nfce = "DOCUMENTO AUXILIAR DA NOTA FISCAL DE CONSUMIDOR" in full_text.upper()
+        
         itens: List[Dict] = []
 
-        # 1) Encontrar cabeçalhos de itens (01, 02, C2, C3, 04...)
-        header_indices: List[int] = []
-        header_pattern = re.compile(r'^(?:\d{1,2}|C\d)\s+\d{5,}\b')
+        # 1) Identificar linhas que são INÍCIO de item (ex: "01 0200...", "02 ...", "C3 ...")
+        header_indices = []
+        header_pattern = re.compile(r'^(?:\d{1,2}|C\d)\s+\d{4,}\b')
 
         for idx, line in enumerate(lines):
             text = " ".join(line['text'].split())
@@ -244,95 +244,127 @@ class OCREngine:
         if not header_indices:
             logger.warning("  Nenhum cabeçalho de item NFC-e detectado.")
         else:
-            logger.info(f"  Cabeçalhos de itens detectados em índices: {header_indices}")
+            logger.info(f"  Cabeçalhos encontrados nos índices: {header_indices}")
 
-        # 2) Para cada cabeçalho, agrupar linhas e extrair dados
-        for i, start in enumerate(header_indices):
-            # fim do grupo: antes do próximo cabeçalho ou no máximo 4 linhas adiante
+        # 2) Processar cada bloco
+        for i, start_idx in enumerate(header_indices):
+            # Define o fim deste bloco: é o início do próximo item OU até 3 linhas pra frente
             if i + 1 < len(header_indices):
-                end = header_indices[i + 1] - 1
+                end_idx = header_indices[i + 1] - 1
             else:
-                end = start + 4
-            end = min(end, len(lines) - 1)
+                end_idx = min(start_idx + 3, len(lines) - 1)  # limite de 3 linhas por item
 
-            group_lines = lines[start:end + 1]
-            header_text = " ".join(group_lines[0]['text'].split())
-            other_text = " ".join(l['text'] for l in group_lines[1:])
-            logger.info(f"  Grupo de linhas {start}-{end}: '{header_text}' / '{other_text}'")
-
-            # Nome do produto a partir do cabeçalho
-            header_clean = re.sub(r'^(?:\d{1,2}|C\d)\s+\d{5,}\s*', '', header_text)
-            header_clean = re.sub(r'\s+(KG|UN|LT|L)\s*$', '', header_clean, flags=re.IGNORECASE)
-            nome = header_clean.strip(" -")
-            if len(nome) < 3:
-                nome = "Produto"
-
-            # Quantidade (usar ÚLTIMA ocorrência para evitar MEG8)
-            qtd = 1.0
-            qtd_matches = list(re.finditer(
-                r'([0-9]+[.,]?[0-9]*)\s*(KG|UN|LT|L)\b',
-                other_text,
-                re.IGNORECASE
-            ))
-            if qtd_matches:
-                m_qtd = qtd_matches[-1]
-                qtd = float(m_qtd.group(1).replace(',', '.'))
-
-            # Valor unitário (após 'x ')
-            unit_match = re.search(r'x\s*([0-9]+[.,][0-9]{2})', other_text)
-            valor_unit = None
-            if unit_match:
-                valor_unit = float(unit_match.group(1).replace(',', '.'))
-
-            # Candidatos a valores monetários no bloco
-            nums = [
-                float(v.replace(',', '.'))
-                for v in re.findall(r'([0-9]+[.,][0-9]{2})', other_text)
-            ]
-
-            valor_total = None
-            if valor_unit is not None and nums:
-                esperado = qtd * valor_unit
-                valor_total = min(nums, key=lambda v: abs(v - esperado))
-                logger.info(
-                    f"    Valores no grupo: {nums}, esperado={esperado:.2f}, "
-                    f"total escolhido={valor_total:.2f}"
-                )
-            elif nums:
-                valor_total = nums[-1]
-                logger.info(
-                    f"    Sem qty/unit claros, usando último valor do grupo: {valor_total:.2f}"
-                )
-
-            if valor_total is None and valor_unit is not None:
-                valor_total = round(qtd * valor_unit, 2)
-
-            if valor_total is None:
-                logger.warning(
-                    f"    Não foi possível determinar total para o item '{nome}', pulando."
-                )
+            # Garante que não invadimos áreas que não são de itens (ex: linha de "TOTAL", "QTD TOTAL")
+            # Se encontrarmos "QTD. TOTAL" ou "VALOR TOTAL" dentro do bloco, cortamos antes.
+            final_end_idx = end_idx  # Inicializa com o end_idx calculado
+            for k in range(start_idx, end_idx + 1):
+                txt_lower = lines[k]['text'].lower()
+                if "qtd" in txt_lower and "total" in txt_lower:
+                    final_end_idx = k - 1
+                    break
+                if "valor" in txt_lower and "total" in txt_lower:
+                    final_end_idx = k - 1
+                    break
+                final_end_idx = k
+            
+            # Pega as linhas do grupo
+            group_lines = lines[start_idx : final_end_idx + 1]
+            
+            if not group_lines:
                 continue
 
-            logger.info(
-                f"    ✓ Item NFC-e: nome='{nome}', qtd={qtd}, "
-                f"unit={valor_unit}, total={valor_total}"
-            )
+            # Reconstrói textos para análise
+            header_line_text = " ".join(group_lines[0]['text'].split())
+            full_block_text = " ".join(l['text'] for l in group_lines) # texto corrido do bloco
+            
+            logger.info(f"  Bloco {i+1} (linhas {start_idx}-{final_end_idx}): {full_block_text}")
 
-            itens.append({
-                "item": nome,
-                "quantidade": qtd,
-                "valor_unitario": round(valor_unit, 2) if valor_unit is not None else None,
-                "valor_total": round(valor_total, 2),
-                "data_compra": data_compra if tipo == 'gasto' else None,
-                "data_venda": data_compra if tipo == 'venda' else None,
-            })
+            # --- A) Nome do Produto ---
+            # Remove o código inicial (ex: "01 123456789")
+            nome_sujo = re.sub(r'^(?:\d{1,2}|C\d)\s+\d+\s+', '', header_line_text)
+            
+            # Limpeza extra no nome: remove sufixos de unidade se estiverem colados
+            nome_limpo = re.sub(r'\s+(KG|UN|LT|L|PC)\s*$', '', nome_sujo, flags=re.IGNORECASE)
+            
+            # Remove lixo de OCR no final do nome se houver (ex: "... MEG8 UN '1 UN ...")
+            match_lixo = re.search(r'\s+\d+\s*(UN|KG|L|LT)\s*[xX]', nome_limpo, re.IGNORECASE)
+            if match_lixo:
+                nome_limpo = nome_limpo[:match_lixo.start()]
 
-        # Se é claramente NFC-e, não aplica fallback agressivo
-        if is_nfce:
-            if not itens:
-                logger.warning("  NFC-e detectada mas nenhum item foi reconhecido.")
+            nome = nome_limpo.strip(" -.'")
+            if len(nome) < 3: nome = "Produto"
+
+            # --- B) Valores (Unitário, Total) e Quantidade ---
+            # 1. Padrão explicito: "0,116 KG x 94,99"
+            pattern_full = r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|LT|L|PC)\s*[xX]\s*([0-9]+[.,][0-9]{2})'
+            match_full = re.search(pattern_full, full_block_text, re.IGNORECASE)
+            
+            qtd = 1.0
+            valor_unit = None
+            
+            if match_full:
+                try:
+                    qtd = float(match_full.group(1).replace(',', '.'))
+                    valor_unit = float(match_full.group(2).replace(',', '.'))
+                except:
+                    pass
+            else:
+                # Se não achou "x valor", tenta achar só quantidade isolada "3 UN"
+                match_qtd = re.search(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|LT|L|PC)\b', full_block_text, re.IGNORECASE)
+                if match_qtd:
+                    try:
+                        qtd = float(match_qtd.group(1).replace(',', '.'))
+                    except:
+                        pass
+
+            # --- C) Valor Total do Item ---
+            valores_encontrados = re.findall(r'([0-9]+[.,][0-9]{2})', full_block_text)
+            valores_float = []
+            for v in valores_encontrados:
+                try:
+                    vf = float(v.replace(',', '.'))
+                    if vf > 0.0:
+                        valores_float.append(vf)
+                except:
+                    pass
+
+            valor_total = None
+
+            if valores_float:
+                if valor_unit is not None:
+                    esperado = qtd * valor_unit
+                    # Pega o valor mais próximo do esperado
+                    valor_total = min(valores_float, key=lambda x: abs(x - esperado))
+                else:
+                    # Se não temos unitário, o total geralmente é o maior ou último valor do bloco
+                    valor_total = valores_float[-1]
+
+            # Correção final: Se o total for igual ao unitário e qtd > 1, algo deu errado? 
+            if valor_unit and valor_total and valor_total < valor_unit and qtd > 1:
+                pass 
+
+            # Validacao basica
+            if valor_total is None and valor_unit:
+                valor_total = round(qtd * valor_unit, 2)
+
+            # --- D) Adicionar ao resultado ---
+            if valor_total is not None:
+                itens.append({
+                    "item": nome,
+                    "quantidade": qtd,
+                    "valor_unitario": valor_unit,
+                    "valor_total": valor_total,
+                    "data_compra": data_compra if tipo == 'gasto' else None,
+                    "data_venda": data_compra if tipo == 'venda' else None,
+                })
+                logger.info(f"    -> Adicionado: {nome} | Qtd: {qtd} | Tot: {valor_total}")
+            else:
+                logger.warning(f"    -> Ignorado (sem valor total): {nome}")
+
+        # Se detectou itens NFC-e, retorna eles.
+        if itens:
             return itens
-
+        
         # ------------------------------------------------------------------
         # Fallback MUITO conservador para outros tipos de comprovante
         # ------------------------------------------------------------------
