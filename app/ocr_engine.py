@@ -16,6 +16,7 @@ class OCREngine:
     def __init__(self, use_gpu: bool = False):
         self.debug_log = [] 
         try:
+            # Inicialização segura
             params = {"use_angle_cls": False, "lang": "pt", "show_log": False}
             if use_gpu: params["use_gpu"] = True
             self.ocr = PaddleOCR(**params)
@@ -55,8 +56,7 @@ class OCREngine:
             data, _, _ = detector.detectAndDecode(img)
             if data: return [{'data': data, 'type': 'QRCODE'}]
             return None
-        except: 
-            return None
+        except: return None
 
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
         self.debug_log = [] 
@@ -68,112 +68,101 @@ class OCREngine:
                 self._log("Erro: Imagem invalida")
                 return []
             
-            # Executa OCR (sem argumentos, usa config do init)
+            # Executa OCR
             result = self.ocr.ocr(img) 
             
             if result is None:
                 self._log("OCR retornou None.")
                 return []
 
-            # === ADAPTADOR UNIVERSAL ===
-            raw_lines = []
+            lines = []
 
-            # 1. Tenta tratar como lista padrão
-            if isinstance(result, list):
-                if len(result) > 0:
-                    # Se for lista de listas plana
-                    if isinstance(result[0], list) and len(result[0]) == 2 and isinstance(result[0][1], tuple):
+            # Pega o primeiro objeto do resultado (pode ser uma lista com 1 objeto)
+            first_obj = result[0] if isinstance(result, list) and len(result) > 0 else result
+
+            # Função auxiliar para pegar atributos (seja dict ou objeto)
+            def get_attr(obj, key):
+                if isinstance(obj, dict): return obj.get(key)
+                return getattr(obj, key, None)
+
+            # === PARSER CIRÚRGICO (Baseado no seu Log) ===
+            # Procura pelas listas paralelas que apareceram no debug
+            rec_texts = get_attr(first_obj, 'rec_texts')
+            rec_scores = get_attr(first_obj, 'rec_scores')
+            rec_polys = get_attr(first_obj, 'dt_polys') or get_attr(first_obj, 'rec_polys')
+
+            # Se achou as listas, itera sobre elas
+            if rec_texts and rec_scores and len(rec_texts) == len(rec_scores):
+                self._log(f"Formato detectado: PaddleX Listas Paralelas ({len(rec_texts)} linhas)")
+                
+                for i in range(len(rec_texts)):
+                    text = rec_texts[i]
+                    confidence = rec_scores[i]
+                    y_pos = 0
+                    
+                    # Extrai Y do polígono
+                    if rec_polys and i < len(rec_polys):
+                        poly = rec_polys[i]
+                        # Converte numpy array para lista se necessario
+                        if hasattr(poly, 'tolist'): poly = poly.tolist()
+                        
+                        # Pega o primeiro Y (ponto superior esquerdo)
+                        if len(poly) > 0:
+                            # Se for [[x,y], [x,y]...]
+                            if isinstance(poly[0], list) or isinstance(poly[0], tuple) or hasattr(poly[0], 'shape'):
+                                y_pos = int(poly[0][1])
+                            # Se for [x,y,x,y...] (flat)
+                            elif len(poly) >= 2:
+                                y_pos = int(poly[1])
+
+                    if text and float(confidence) > 0.4:
+                        lines.append({
+                            'text': str(text).strip(),
+                            'confidence': round(float(confidence), 3),
+                            'y_position': y_pos
+                        })
+
+            # CASO LEGADO (Lista de linhas antiga)
+            else:
+                self._log("Formato detectado: Lista Padrao/Legado")
+                raw_lines = []
+                if isinstance(result, list):
+                    if len(result) > 0 and isinstance(result[0], list) and len(result[0]) == 2 and isinstance(result[0][1], tuple):
                          raw_lines = result
-                    # Se for lista aninhada (padrão antigo)
                     elif isinstance(result[0], list) and isinstance(result[0][0], list):
                          raw_lines = result[0]
-                    # Se for lista de objetos estranhos (OCRResult)
                     else:
-                         # Tenta converter o objeto container em lista, ou usa a própria lista se já for iterável
-                         try:
-                            # Tenta acessar result[0] se for o container
-                            if hasattr(result[0], '__iter__') and not isinstance(result[0], dict):
-                                 # Verifica se result[0] é o container de linhas ou uma linha
-                                 # Hack: converte pra lista e vê o tamanho/tipo
-                                 temp = list(result[0])
-                                 if len(temp) > 0 and (isinstance(temp[0], dict) or isinstance(temp[0], list)):
-                                     raw_lines = temp
-                                 else:
-                                     raw_lines = result
-                            else:
-                                raw_lines = result
-                         except:
+                         # Tenta usar result direto se não for o objeto complexo
+                         if not get_attr(result[0], 'rec_texts'):
                             raw_lines = result
-            else:
-                 # Se result não for lista, tenta iterar ele direto
-                 try:
-                     raw_lines = list(result)
-                 except:
-                     pass
 
-            self._log(f"Raw Lines extraidas: {len(raw_lines)}")
-
-            # === LOG ESPIÃO (O MAIS IMPORTANTE) ===
-            if len(raw_lines) > 0:
-                self._log(f"DEBUG TIPO ITEM 0: {type(raw_lines[0])}")
-                self._log(f"DEBUG CONTEUDO ITEM 0: {str(raw_lines[0])}")
-
-            # === PARSER DE LINHAS ===
-            lines = []
-            for item in raw_lines:
-                text = ""
-                confidence = 0.0
-                y_pos = 0
-                
-                # TIPO A: Lista [ [[x,y]..], (text, conf) ]
-                if isinstance(item, list) and len(item) >= 2:
-                    if isinstance(item[0], list) and len(item[0]) > 0:
-                         y_pos = int(item[0][0][1])
-                    if isinstance(item[1], tuple) or isinstance(item[1], list):
-                        text = item[1][0]
-                        confidence = item[1][1]
-                
-                # TIPO B: Dicionário (PaddleX / OCRResult convertido)
-                elif isinstance(item, dict):
-                    # Tenta todas as variações conhecidas de chaves
-                    text = item.get('text') or item.get('rec_text') or item.get('label') or ''
+                for item in raw_lines:
+                    text = ""
+                    confidence = 0.0
+                    y_pos = 0
                     
-                    # Confiança
-                    conf_val = item.get('confidence') or item.get('score') or item.get('rec_score') or 0
-                    if conf_val: confidence = float(conf_val)
-
-                    # Box/Posição
-                    # Procura 'box', 'dt_boxes', 'bbox', 'poly', 'dt_polys'
-                    box = item.get('box') or item.get('dt_boxes') or item.get('bbox') or item.get('poly') or item.get('dt_polys')
+                    if isinstance(item, list) and len(item) >= 2:
+                        if isinstance(item[0], list) and len(item[0]) > 0:
+                             y_pos = int(item[0][0][1])
+                        if isinstance(item[1], tuple) or isinstance(item[1], list):
+                            text = item[1][0]
+                            confidence = item[1][1]
                     
-                    if box and isinstance(box, list) and len(box) > 0:
-                        # Box pode ser [[x,y],...] ou [x,y,w,h]
-                        first_point = box[0]
-                        if isinstance(first_point, list) or isinstance(first_point, tuple):
-                             y_pos = int(first_point[1]) # [[x,y]...]
-                        else:
-                             # Formato [xmin, ymin, xmax, ymax]
-                             y_pos = int(box[1]) 
-
-                # TIPO C: Objeto
-                elif hasattr(item, 'text') or hasattr(item, 'rec_text'):
-                    text = getattr(item, 'text', '') or getattr(item, 'rec_text', '')
-                    confidence = getattr(item, 'confidence', 0) or getattr(item, 'score', 0)
-                    box = getattr(item, 'box', None) or getattr(item, 'dt_boxes', None) or getattr(item, 'bbox', None)
-                    if box and len(box) > 0: y_pos = int(box[0][1])
-
-                if text and confidence > 0.4:
-                    lines.append({
-                        'text': str(text).strip(),
-                        'confidence': round(confidence, 3),
-                        'y_position': y_pos
-                    })
+                    if text and confidence > 0.4:
+                        lines.append({
+                            'text': str(text).strip(),
+                            'confidence': round(confidence, 3),
+                            'y_position': y_pos
+                        })
 
             lines.sort(key=lambda x: x['y_position'])
             
             self._log(f"Final Lines processadas: {len(lines)}")
             if len(lines) > 0:
                 self._log(f"Ex L0: {lines[0]['text']}")
+            else:
+                 # Log extra se falhar
+                 if rec_texts: self._log(f"Achou rec_texts mas falhou loop. Len texts: {len(rec_texts)}")
                 
             return lines
 
@@ -249,7 +238,7 @@ class OCREngine:
             if idx > 0:
                 prev = lines[idx-1]['text']
                 if not x_regex.search(prev) and len(prev) > 3:
-                    nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', prev).strip(" -.'\"")
+                     nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', prev).strip(" -.'\"")
 
             item = self._parse_block_values(block_text, nome, data_compra, tipo)
             if item: itens.append(item)
