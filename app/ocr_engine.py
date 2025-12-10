@@ -16,7 +16,6 @@ class OCREngine:
     def __init__(self, use_gpu: bool = False):
         self.debug_log = [] 
         try:
-            # Inicialização segura
             params = {"use_angle_cls": False, "lang": "pt", "show_log": False}
             if use_gpu: params["use_gpu"] = True
             self.ocr = PaddleOCR(**params)
@@ -63,68 +62,51 @@ class OCREngine:
         try:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
             if img is None: 
                 self._log("Erro: Imagem invalida")
                 return []
             
-            # Executa OCR
             result = self.ocr.ocr(img) 
-            
             if result is None:
                 self._log("OCR retornou None.")
                 return []
 
-            lines = []
-
-            # Pega o primeiro objeto do resultado (pode ser uma lista com 1 objeto)
+            # === PARSER DE ESTRUTURA ===
+            # Detecta formato PaddleX vs Lista
             first_obj = result[0] if isinstance(result, list) and len(result) > 0 else result
 
-            # Função auxiliar para pegar atributos (seja dict ou objeto)
             def get_attr(obj, key):
                 if isinstance(obj, dict): return obj.get(key)
                 return getattr(obj, key, None)
 
-            # === PARSER CIRÚRGICO (Baseado no seu Log) ===
-            # Procura pelas listas paralelas que apareceram no debug
             rec_texts = get_attr(first_obj, 'rec_texts')
             rec_scores = get_attr(first_obj, 'rec_scores')
             rec_polys = get_attr(first_obj, 'dt_polys') or get_attr(first_obj, 'rec_polys')
 
-            # Se achou as listas, itera sobre elas
+            lines = []
+
+            # FORMATO PADDLEX (Listas Paralelas)
             if rec_texts and rec_scores and len(rec_texts) == len(rec_scores):
-                self._log(f"Formato detectado: PaddleX Listas Paralelas ({len(rec_texts)} linhas)")
-                
+                self._log(f"Formato: PaddleX ({len(rec_texts)} linhas)")
                 for i in range(len(rec_texts)):
                     text = rec_texts[i]
                     confidence = rec_scores[i]
                     y_pos = 0
-                    
-                    # Extrai Y do polígono
                     if rec_polys and i < len(rec_polys):
                         poly = rec_polys[i]
-                        # Converte numpy array para lista se necessario
                         if hasattr(poly, 'tolist'): poly = poly.tolist()
-                        
-                        # Pega o primeiro Y (ponto superior esquerdo)
                         if len(poly) > 0:
-                            # Se for [[x,y], [x,y]...]
                             if isinstance(poly[0], list) or isinstance(poly[0], tuple) or hasattr(poly[0], 'shape'):
                                 y_pos = int(poly[0][1])
-                            # Se for [x,y,x,y...] (flat)
                             elif len(poly) >= 2:
                                 y_pos = int(poly[1])
-
+                    
                     if text and float(confidence) > 0.4:
-                        lines.append({
-                            'text': str(text).strip(),
-                            'confidence': round(float(confidence), 3),
-                            'y_position': y_pos
-                        })
+                        lines.append({'text': str(text).strip(), 'confidence': round(float(confidence), 3), 'y_position': y_pos})
 
-            # CASO LEGADO (Lista de linhas antiga)
+            # FORMATO LEGADO
             else:
-                self._log("Formato detectado: Lista Padrao/Legado")
+                self._log("Formato: Legado")
                 raw_lines = []
                 if isinstance(result, list):
                     if len(result) > 0 and isinstance(result[0], list) and len(result[0]) == 2 and isinstance(result[0][1], tuple):
@@ -132,38 +114,22 @@ class OCREngine:
                     elif isinstance(result[0], list) and isinstance(result[0][0], list):
                          raw_lines = result[0]
                     else:
-                         # Tenta usar result direto se não for o objeto complexo
-                         if not get_attr(result[0], 'rec_texts'):
-                            raw_lines = result
+                         if not get_attr(result[0], 'rec_texts'): raw_lines = result
 
                 for item in raw_lines:
                     text = ""
                     confidence = 0.0
                     y_pos = 0
-                    
                     if isinstance(item, list) and len(item) >= 2:
-                        if isinstance(item[0], list) and len(item[0]) > 0:
-                             y_pos = int(item[0][0][1])
+                        if isinstance(item[0], list) and len(item[0]) > 0: y_pos = int(item[0][0][1])
                         if isinstance(item[1], tuple) or isinstance(item[1], list):
                             text = item[1][0]
                             confidence = item[1][1]
-                    
                     if text and confidence > 0.4:
-                        lines.append({
-                            'text': str(text).strip(),
-                            'confidence': round(confidence, 3),
-                            'y_position': y_pos
-                        })
+                        lines.append({'text': str(text).strip(), 'confidence': round(confidence, 3), 'y_position': y_pos})
 
             lines.sort(key=lambda x: x['y_position'])
-            
-            self._log(f"Final Lines processadas: {len(lines)}")
-            if len(lines) > 0:
-                self._log(f"Ex L0: {lines[0]['text']}")
-            else:
-                 # Log extra se falhar
-                 if rec_texts: self._log(f"Achou rec_texts mas falhou loop. Len texts: {len(rec_texts)}")
-                
+            self._log(f"Linhas finais: {len(lines)}")
             return lines
 
         except Exception as e:
@@ -176,19 +142,16 @@ class OCREngine:
         
         itens = self._extract_items_smart(ocr_lines, full_text, tipo)
         
+        # Fallback apenas se Smart retornar zero itens
         if not itens:
-            self._log("Smart falhou. Tentando Fallback X...")
+            self._log("Smart zero itens. Tentando Fallback X...")
             itens = self._extract_items_fallback_x(ocr_lines, full_text, tipo)
-
-        msg = None
-        if not itens:
-            msg = "DEBUG: " + " | ".join(self.debug_log)
 
         return {
             "tipo_documento": tipo,
             "itens": itens,
             "qrcode_url": qr_data[0]['data'] if qr_data else None,
-            "mensagem": msg,
+            "mensagem": " | ".join(self.debug_log[-5:]) if not itens else None,
             "confianca": 1.0 if itens else 0.0
         }
 
@@ -196,28 +159,48 @@ class OCREngine:
         data_compra = self._extract_date(full_text)
         itens = []
         
+        # Regex NFC-e: Inicio linha + (digitos ou C+digito) + espaco + digitos longos
         header_regex = re.compile(r'(?:^|\s)(?:\d{1,3}|C\d)\s+\d+')
         header_indices = [i for i, l in enumerate(lines) if header_regex.search(l['text'])]
         
-        self._log(f"Indices Smart: {header_indices}")
+        self._log(f"Indices: {header_indices}")
 
         for i, idx in enumerate(header_indices):
-            start_search = max(0, idx - 1)
-            end_search = min(idx + 6, len(lines))
+            # === CORREÇÃO CRÍTICA DE JANELA ===
+            # Janela começa no índice ATUAL (idx). Nunca idx-1.
+            # Vai até o próximo índice de cabeçalho.
+            start_search = idx
+            
+            if i + 1 < len(header_indices):
+                end_search = header_indices[i+1] # Para EXATAMENTE antes do próximo item
+            else:
+                end_search = min(idx + 6, len(lines)) # Último item: olha 6 linhas pra frente
             
             search_lines = lines[start_search:end_search]
             block_text = " ".join([l['text'] for l in search_lines])
             
+            # Limpeza Nome
             header_text = lines[idx]['text']
             nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', header_text) 
             nome = re.sub(r'\s+(KG|UN|LT|L)\s*$', '', nome, flags=re.IGNORECASE)
+            # Remove lixo do final se tiver X
             match_lixo = re.search(r'\s+[\d\.\,]*\s*(UN|KG|L|LT).*?[xX]', nome, re.IGNORECASE)
             if match_lixo: nome = nome[:match_lixo.start()]
             nome = nome.strip(" -.'\"") or "Produto"
 
             item = self._parse_block_values(block_text, nome, data_compra, tipo)
-            if item: itens.append(item)
-        
+            
+            if item: 
+                itens.append(item)
+            else:
+                # Se falhar usando a janela restrita, aí sim tentamos um "lookahead" suave
+                # Caso a linha de valores tenha ficado órfã logo abaixo do limite
+                if i + 1 < len(header_indices): # Só se não for o último
+                     extra_lines = lines[start_search : end_search + 1] # Pega +1 linha
+                     block_text_extra = " ".join([l['text'] for l in extra_lines])
+                     item_retry = self._parse_block_values(block_text_extra, nome, data_compra, tipo)
+                     if item_retry: itens.append(item_retry)
+
         return itens
 
     def _extract_items_fallback_x(self, lines: List[Dict], full_text: str, tipo: str) -> List[Dict]:
@@ -227,8 +210,6 @@ class OCREngine:
         x_regex = re.compile(r'([0-9]+[.,]?[0-9]*)\s*.*?[xX]\s*([0-9]+[.,]?[0-9a-zA-Z]+)', re.IGNORECASE)
         x_indices = [i for i, l in enumerate(lines) if x_regex.search(l['text'])]
         
-        self._log(f"Indices X: {x_indices}")
-
         for idx in x_indices:
             start_search = max(0, idx - 1)
             end_search = min(idx + 2, len(lines))
@@ -251,6 +232,7 @@ class OCREngine:
         
         clean_block = block_text.replace('C', '0').replace('O', '0')
         
+        # Regex Qtd x Unit
         m_full = re.search(r'([0-9]+[.,]?[0-9]*)\s*.*?[xX]\s*([0-9]+[.,][0-9]+)', clean_block, re.IGNORECASE)
         if m_full:
             try:
@@ -268,6 +250,7 @@ class OCREngine:
         if unit is not None:
             valor_total = round(qtd * unit, 2)
         else:
+            # Caça ao total
             candidates = []
             for val_str in re.findall(r'(\d+[.,]\d{2})', block_text):
                 try: candidates.append(float(val_str.replace(',', '.')))
