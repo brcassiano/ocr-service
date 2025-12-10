@@ -16,7 +16,7 @@ class OCREngine:
     def __init__(self, use_gpu: bool = False):
         self.debug_log = [] 
         try:
-            # Inicializa OCR
+            # Configuração inicial define se usa CLS ou não
             params = {"use_angle_cls": False, "lang": "pt", "show_log": False}
             if use_gpu: params["use_gpu"] = True
             self.ocr = PaddleOCR(**params)
@@ -65,48 +65,46 @@ class OCREngine:
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None: return []
             
-            # Executa OCR
-            # IMPORTANTE: Algumas versões retornam lista de listas, outras lista pura
-            result = self.ocr.ocr(img, cls=False) 
+            # --- CORREÇÃO FINAL AQUI ---
+            # Removemos qualquer argumento extra. O PaddleOCR usará a config do __init__.
+            result = self.ocr.ocr(img) 
             
             if result is None:
                 self._log("OCR retornou None.")
                 return []
             
-            # Normalização defensiva da estrutura
+            # Normalização defensiva da estrutura (Lista de Listas vs Lista Pura)
             ocr_data = []
             if isinstance(result, list):
                 if len(result) > 0 and isinstance(result[0], list):
-                    # Estrutura comum: [[box, (text, conf)], ...]
-                    # Às vezes vem aninhado: [ [[box, (text, conf)], ...], ... ]
+                    # Verifica se é aninhamento triplo (comum em algumas versões)
                     if len(result[0]) > 0 and isinstance(result[0][0], list) and len(result[0][0]) == 4:
-                         # Caso aninhado extra (acontece em algumas versões)
                          ocr_data = result[0]
                     else:
-                         # Caso padrão plano ou aninhado simples
-                         # Vamos tentar iterar e ver o que são os itens
+                         # Aninhamento duplo padrão ou lista plana disfarçada
                          first_item = result[0]
-                         if isinstance(first_item, list):
-                             ocr_data = first_item
+                         # Se o primeiro item for uma lista contendo coordenadas [[x,y]..], é um item
+                         # Se for uma lista contendo VÁRIOS itens, então result[0] é a lista de itens
+                         if len(first_item) > 0 and isinstance(first_item[0], list) and len(first_item[0]) == 4:
+                             ocr_data = result[0] # Lista de itens estava dentro de result[0]
                          else:
-                             ocr_data = result # Lista plana
+                             ocr_data = result # A lista já é os itens
                 else:
                     ocr_data = result
             
             lines = []
             for line in ocr_data:
-                # Estrutura esperada: [ [[x,y], ...], (text, conf) ]
+                # Valida estrutura [box, (text, conf)]
                 if not isinstance(line, list) or len(line) < 2:
                     continue
                 
-                text_info = line[1] # (text, conf)
+                text_info = line[1]
                 if not isinstance(text_info, tuple) and not isinstance(text_info, list):
                     continue
                 
                 text = text_info[0].strip()
                 confidence = text_info[1]
                 
-                # Pega Y position do box (primeiro ponto)
                 box = line[0]
                 y_pos = 0
                 if isinstance(box, list) and len(box) > 0:
@@ -123,7 +121,7 @@ class OCREngine:
             
             self._log(f"OCR leu {len(lines)} linhas.")
             if len(lines) > 0:
-                self._log(f"Exemplo: {lines[0]['text']}")
+                self._log(f"Exemplo L0: {lines[0]['text']}")
                 
             return lines
         except Exception as e:
