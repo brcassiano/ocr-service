@@ -68,7 +68,7 @@ class OCREngine:
                 self._log("Erro: Imagem invalida")
                 return []
             
-            # Executa OCR
+            # Executa OCR (sem argumentos, usa config do init)
             result = self.ocr.ocr(img) 
             
             if result is None:
@@ -76,44 +76,47 @@ class OCREngine:
                 return []
 
             # === ADAPTADOR UNIVERSAL ===
-            # O objetivo é transformar 'result' em uma Lista de Linhas padronizada
             raw_lines = []
 
-            # Diagnóstico rápido do tipo
-            self._log(f"Result Type: {type(result)}")
-            if isinstance(result, list) and len(result) > 0:
-                self._log(f"Item[0] Type: {type(result[0])}")
-
-            # CASO 1: Lista de Listas (Padrão Antigo / Lista Plana)
-            # ex: [ [[box], (text, conf)], ... ]
-            if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list) and len(result[0]) == 2 and isinstance(result[0][1], tuple):
-                raw_lines = result
-            
-            # CASO 2: Aninhado (Padrão PaddleOCR Comum)
-            # ex: [ [ [[box], (text, conf)], ... ] ]
-            elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
-                 # Se o primeiro item é uma lista de listas, então result[0] é o que queremos
-                 raw_lines = result[0]
-            
-            # CASO 3: Objeto OCRResult (O caso atual!)
-            # Se result[0] não for lista, assumimos que é o objeto container.
-            # Vamos tentar iterar sobre ele ou sobre o próprio result se ele for o container.
-            elif isinstance(result, list) and len(result) == 1:
-                obj = result[0]
-                # Se for o objeto OCRResult, ele costuma ser iterável ou ter propriedades
-                # Tentamos converter para lista
-                try:
-                    raw_lines = list(obj)
-                except:
-                    # Se não der pra converter em lista, tentamos acessar atributos conhecidos
-                    # ou salvamos o dir() para debug
-                    self._log(f"Objeto nao iteravel. Atributos: {dir(obj)}")
-                    return []
+            # 1. Tenta tratar como lista padrão
+            if isinstance(result, list):
+                if len(result) > 0:
+                    # Se for lista de listas plana
+                    if isinstance(result[0], list) and len(result[0]) == 2 and isinstance(result[0][1], tuple):
+                         raw_lines = result
+                    # Se for lista aninhada (padrão antigo)
+                    elif isinstance(result[0], list) and isinstance(result[0][0], list):
+                         raw_lines = result[0]
+                    # Se for lista de objetos estranhos (OCRResult)
+                    else:
+                         # Tenta converter o objeto container em lista, ou usa a própria lista se já for iterável
+                         try:
+                            # Tenta acessar result[0] se for o container
+                            if hasattr(result[0], '__iter__') and not isinstance(result[0], dict):
+                                 # Verifica se result[0] é o container de linhas ou uma linha
+                                 # Hack: converte pra lista e vê o tamanho/tipo
+                                 temp = list(result[0])
+                                 if len(temp) > 0 and (isinstance(temp[0], dict) or isinstance(temp[0], list)):
+                                     raw_lines = temp
+                                 else:
+                                     raw_lines = result
+                            else:
+                                raw_lines = result
+                         except:
+                            raw_lines = result
             else:
-                # Tenta iterar sobre o result direto
-                raw_lines = result
+                 # Se result não for lista, tenta iterar ele direto
+                 try:
+                     raw_lines = list(result)
+                 except:
+                     pass
 
             self._log(f"Raw Lines extraidas: {len(raw_lines)}")
+
+            # === LOG ESPIÃO (O MAIS IMPORTANTE) ===
+            if len(raw_lines) > 0:
+                self._log(f"DEBUG TIPO ITEM 0: {type(raw_lines[0])}")
+                self._log(f"DEBUG CONTEUDO ITEM 0: {str(raw_lines[0])}")
 
             # === PARSER DE LINHAS ===
             lines = []
@@ -122,34 +125,46 @@ class OCREngine:
                 confidence = 0.0
                 y_pos = 0
                 
-                # Tenta extrair de LISTA [box, (text, conf)]
+                # TIPO A: Lista [ [[x,y]..], (text, conf) ]
                 if isinstance(item, list) and len(item) >= 2:
-                    # Pega Box
                     if isinstance(item[0], list) and len(item[0]) > 0:
                          y_pos = int(item[0][0][1])
-                    # Pega Texto
                     if isinstance(item[1], tuple) or isinstance(item[1], list):
                         text = item[1][0]
                         confidence = item[1][1]
                 
-                # Tenta extrair de DICIONÁRIO {'text': ..., 'confidence': ..., 'box': ...}
+                # TIPO B: Dicionário (PaddleX / OCRResult convertido)
                 elif isinstance(item, dict):
-                    text = item.get('text', '') or item.get('rec_text', '')
-                    confidence = item.get('confidence', 0) or item.get('score', 0) or item.get('rec_score', 0)
-                    box = item.get('box') or item.get('dt_boxes')
-                    if box: y_pos = int(box[0][1])
+                    # Tenta todas as variações conhecidas de chaves
+                    text = item.get('text') or item.get('rec_text') or item.get('label') or ''
+                    
+                    # Confiança
+                    conf_val = item.get('confidence') or item.get('score') or item.get('rec_score') or 0
+                    if conf_val: confidence = float(conf_val)
 
-                # Tenta extrair de OBJETO (atributos)
-                else:
+                    # Box/Posição
+                    # Procura 'box', 'dt_boxes', 'bbox', 'poly', 'dt_polys'
+                    box = item.get('box') or item.get('dt_boxes') or item.get('bbox') or item.get('poly') or item.get('dt_polys')
+                    
+                    if box and isinstance(box, list) and len(box) > 0:
+                        # Box pode ser [[x,y],...] ou [x,y,w,h]
+                        first_point = box[0]
+                        if isinstance(first_point, list) or isinstance(first_point, tuple):
+                             y_pos = int(first_point[1]) # [[x,y]...]
+                        else:
+                             # Formato [xmin, ymin, xmax, ymax]
+                             y_pos = int(box[1]) 
+
+                # TIPO C: Objeto
+                elif hasattr(item, 'text') or hasattr(item, 'rec_text'):
                     text = getattr(item, 'text', '') or getattr(item, 'rec_text', '')
                     confidence = getattr(item, 'confidence', 0) or getattr(item, 'score', 0)
-                    # Tenta pegar box
-                    box = getattr(item, 'box', None) or getattr(item, 'dt_boxes', None)
-                    if box: y_pos = int(box[0][1])
+                    box = getattr(item, 'box', None) or getattr(item, 'dt_boxes', None) or getattr(item, 'bbox', None)
+                    if box and len(box) > 0: y_pos = int(box[0][1])
 
                 if text and confidence > 0.4:
                     lines.append({
-                        'text': text.strip(),
+                        'text': str(text).strip(),
                         'confidence': round(confidence, 3),
                         'y_position': y_pos
                     })
