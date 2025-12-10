@@ -12,6 +12,13 @@ logger = logging.getLogger(__name__)
 
 class OCREngine:
     KEYWORDS_VENDA = ['recebido', 'pix recebido', 'crédito em conta', 'depósito', 'recibo']
+    
+    # Dicionário para corrigir erros recorrentes de leitura
+    COMMON_CORRECTIONS = {
+        "ALHOTRADIC": "ALHO TRADIC",
+        "QJ": "QUEIJO",
+        "BATATA LAVADA": "BATATA LAVADA" 
+    }
 
     def __init__(self, use_gpu: bool = False):
         self.debug_log = [] 
@@ -67,7 +74,7 @@ class OCREngine:
             result = self.ocr.ocr(img) 
             if result is None: return []
 
-            # PARSER DE ESTRUTURA
+            # Parser de Estrutura
             first_obj = result[0] if isinstance(result, list) and len(result) > 0 else result
 
             def get_attr(obj, key):
@@ -80,6 +87,7 @@ class OCREngine:
 
             lines = []
 
+            # Logica Principal
             if rec_texts and rec_scores and len(rec_texts) == len(rec_scores):
                 for i in range(len(rec_texts)):
                     text = rec_texts[i]
@@ -137,9 +145,7 @@ class OCREngine:
         header_indices = [i for i, l in enumerate(lines) if header_regex.search(l['text'])]
 
         for i, idx in enumerate(header_indices):
-            start_search = idx # Começa na linha do nome
-            
-            # Janela de busca segura
+            start_search = idx
             if i + 1 < len(header_indices):
                 end_search = header_indices[i+1]
             else:
@@ -148,13 +154,11 @@ class OCREngine:
             search_lines = lines[start_search:end_search]
             block_text = " ".join([l['text'] for l in search_lines])
             
-            # Nome
+            # Pega nome bruto
             header_text = lines[idx]['text']
-            nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', header_text) 
-            nome = re.sub(r'\s+(KG|UN|LT|L)\s*$', '', nome, flags=re.IGNORECASE)
-            match_lixo = re.search(r'\s+[\d\.\,]*\s*(UN|KG|L|LT).*?[xX]', nome, re.IGNORECASE)
-            if match_lixo: nome = nome[:match_lixo.start()]
-            nome = nome.strip(" -.'\"") or "Produto"
+            
+            # Limpa o nome usando função dedicada
+            nome = self._clean_name(header_text)
 
             item = self._parse_block_values(block_text, nome, data_compra, tipo)
             if item: itens.append(item)
@@ -164,7 +168,6 @@ class OCREngine:
     def _extract_items_fallback_x(self, lines: List[Dict], full_text: str, tipo: str) -> List[Dict]:
         data_compra = self._extract_date(full_text)
         itens = []
-        
         x_regex = re.compile(r'([0-9]+[.,]?[0-9]*)\s*.*?[xX]\s*([0-9]+[.,]?[0-9a-zA-Z]+)', re.IGNORECASE)
         x_indices = [i for i, l in enumerate(lines) if x_regex.search(l['text'])]
         
@@ -177,28 +180,45 @@ class OCREngine:
             if idx > 0:
                 prev = lines[idx-1]['text']
                 if not x_regex.search(prev) and len(prev) > 3:
-                     nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', prev).strip(" -.'\"")
+                     nome = self._clean_name(prev)
 
             item = self._parse_block_values(block_text, nome, data_compra, tipo)
             if item: itens.append(item)
 
         return itens
 
+    def _clean_name(self, text: str) -> str:
+        """Limpa, padroniza e corrige nomes de produtos"""
+        # 1. Remove códigos iniciais (Ex: 01, C1, 0200...)
+        text = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', text)
+        
+        # 2. Remove Unidades do final (KG, UN...)
+        text = re.sub(r'\s+(KG|UN|LT|L|PC|M)\s*$', '', text, flags=re.IGNORECASE)
+        
+        # 3. Remove "lixo" que sobrou de regex mal feito (Ex: "UN x")
+        match_lixo = re.search(r'\s+[\d\.\,]*\s*(UN|KG|L|LT).*?[xX]', text, re.IGNORECASE)
+        if match_lixo: text = text[:match_lixo.start()]
+
+        # 4. Remove caracteres especiais indesejados (mantem letras, numeros, espaço, traço e ponto)
+        text = re.sub(r'[^a-zA-Z0-9\s\-\.]', '', text)
+        
+        # 5. Padroniza para MAIÚSCULO e remove espaços duplos
+        text = re.sub(r'\s+', ' ', text).strip().upper()
+
+        # 6. Aplica correções manuais do dicionário
+        for wrong, right in self.COMMON_CORRECTIONS.items():
+            if wrong in text:
+                text = text.replace(wrong, right)
+                
+        return text
+
     def _parse_block_values(self, block_text, nome, data_compra, tipo):
         qtd = 1.0
         unit = None
         
-        # Limpa caracteres comuns de erro OCR
         clean_block = block_text.replace('C', '0').replace('O', '0')
-        
-        # === CORREÇÃO AQUI ===
-        # Removemos o início da string que contém o código do item "01 0200..." 
-        # para que o regex de quantidade não capture o "01" ou "02" erroneamente.
-        # Removemos qualquer sequencia de digitos iniciais seguida de espaco
         clean_block_no_header = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', clean_block)
 
-        # Regex RIGOROSO: Exige unidade (UN/KG) ou 'x' explícito
-        # Não aceita número solto como quantidade na primeira tentativa
         m_full = re.search(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|L|LT|PC)\s*[xX]\s*([0-9]+[.,][0-9]+)', clean_block_no_header, re.IGNORECASE)
         
         if m_full:
@@ -207,8 +227,6 @@ class OCREngine:
                 unit = float(m_full.group(2).replace(',', '.'))
             except: pass
         else:
-             # Tentativa 2: Procura 'X' sem unidade (ex: 0.116 x 94.99)
-             # Mas ignorando números inteiros pequenos no inicio (1, 2, 3...) que podem ser índice
              m_x_simple = re.search(r'([0-9]+[.,][0-9]+)\s*[xX]\s*([0-9]+[.,][0-9]+)', clean_block_no_header, re.IGNORECASE)
              if m_x_simple:
                  try:
@@ -226,7 +244,6 @@ class OCREngine:
                 try: candidates.append(float(val_str.replace(',', '.')))
                 except: pass
             
-            # Filtra valor igual à Qtd ou Unit
             valid_candidates = [c for c in candidates if abs(c - qtd) > 0.001]
             if valid_candidates: 
                 valor_total = valid_candidates[-1]
