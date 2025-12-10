@@ -16,7 +16,6 @@ class OCREngine:
     def __init__(self, use_gpu: bool = False):
         self.debug_log = [] 
         try:
-            # Configuração inicial define se usa CLS ou não
             params = {"use_angle_cls": False, "lang": "pt", "show_log": False}
             if use_gpu: params["use_gpu"] = True
             self.ocr = PaddleOCR(**params)
@@ -56,45 +55,56 @@ class OCREngine:
             data, _, _ = detector.detectAndDecode(img)
             if data: return [{'data': data, 'type': 'QRCODE'}]
             return None
-        except: return None
+        except: 
+            return None
 
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
         self.debug_log = [] 
         try:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None: return []
             
-            # --- CORREÇÃO FINAL AQUI ---
-            # Removemos qualquer argumento extra. O PaddleOCR usará a config do __init__.
-            result = self.ocr.ocr(img) 
-            
-            if result is None:
-                self._log("OCR retornou None.")
+            if img is None: 
+                self._log("Erro: Falha no cv2.imdecode (imagem invalida/corrompida)")
                 return []
             
-            # Normalização defensiva da estrutura (Lista de Listas vs Lista Pura)
+            self._log(f"Img Shape: {img.shape}")
+
+            result = self.ocr.ocr(img) 
+            
+            self._log(f"Raw Type: {type(result)}")
+            if isinstance(result, list):
+                self._log(f"List Len: {len(result)}")
+                if len(result) > 0:
+                    self._log(f"Item[0] Type: {type(result[0])}")
+                    if isinstance(result[0], list):
+                        self._log(f"Item[0] Len: {len(result[0])}")
+
+            if result is None:
+                self._log("OCR retornou None direto.")
+                return []
+
             ocr_data = []
             if isinstance(result, list):
-                if len(result) > 0 and isinstance(result[0], list):
-                    # Verifica se é aninhamento triplo (comum em algumas versões)
-                    if len(result[0]) > 0 and isinstance(result[0][0], list) and len(result[0][0]) == 4:
-                         ocr_data = result[0]
+                if len(result) > 0:
+                    if result[0] is None:
+                        self._log("OCR retornou [None]. Nenhum texto detectado.")
+                        return []
+                    
+                    if isinstance(result[0], list):
+                        first_inner = result[0]
+                        if len(first_inner) > 0 and isinstance(first_inner[0], list) and len(first_inner[0]) == 4:
+                            ocr_data = result[0]
+                        else:
+                            ocr_data = result
                     else:
-                         # Aninhamento duplo padrão ou lista plana disfarçada
-                         first_item = result[0]
-                         # Se o primeiro item for uma lista contendo coordenadas [[x,y]..], é um item
-                         # Se for uma lista contendo VÁRIOS itens, então result[0] é a lista de itens
-                         if len(first_item) > 0 and isinstance(first_item[0], list) and len(first_item[0]) == 4:
-                             ocr_data = result[0] # Lista de itens estava dentro de result[0]
-                         else:
-                             ocr_data = result # A lista já é os itens
+                        ocr_data = result
                 else:
-                    ocr_data = result
+                    self._log("OCR retornou lista vazia []")
+                    return []
             
             lines = []
-            for line in ocr_data:
-                # Valida estrutura [box, (text, conf)]
+            for idx, line in enumerate(ocr_data):
                 if not isinstance(line, list) or len(line) < 2:
                     continue
                 
@@ -119,13 +129,14 @@ class OCREngine:
             
             lines.sort(key=lambda x: x['y_position'])
             
-            self._log(f"OCR leu {len(lines)} linhas.")
+            self._log(f"Linhas validas processadas: {len(lines)}")
             if len(lines) > 0:
-                self._log(f"Exemplo L0: {lines[0]['text']}")
+                self._log(f"Ex L0: {lines[0]['text']}")
                 
             return lines
+
         except Exception as e:
-            self._log(f"Erro FATAL no OCR.ocr(): {e}")
+            self._log(f"Erro FATAL extract_text: {str(e)}")
             return []
 
     def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
@@ -196,7 +207,7 @@ class OCREngine:
             if idx > 0:
                 prev = lines[idx-1]['text']
                 if not x_regex.search(prev) and len(prev) > 3:
-                     nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', prev).strip(" -.'\"")
+                    nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', prev).strip(" -.'\"")
 
             item = self._parse_block_values(block_text, nome, data_compra, tipo)
             if item: itens.append(item)
