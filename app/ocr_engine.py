@@ -65,71 +65,98 @@ class OCREngine:
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if img is None: 
-                self._log("Erro: Falha no cv2.imdecode (imagem invalida/corrompida)")
+                self._log("Erro: Imagem invalida")
                 return []
             
-            self._log(f"Img Shape: {img.shape}")
-
+            # Executa OCR
             result = self.ocr.ocr(img) 
             
-            self._log(f"Raw Type: {type(result)}")
-            if isinstance(result, list):
-                self._log(f"List Len: {len(result)}")
-                if len(result) > 0:
-                    self._log(f"Item[0] Type: {type(result[0])}")
-                    if isinstance(result[0], list):
-                        self._log(f"Item[0] Len: {len(result[0])}")
-
             if result is None:
-                self._log("OCR retornou None direto.")
+                self._log("OCR retornou None.")
                 return []
 
-            ocr_data = []
-            if isinstance(result, list):
-                if len(result) > 0:
-                    if result[0] is None:
-                        self._log("OCR retornou [None]. Nenhum texto detectado.")
-                        return []
-                    
-                    if isinstance(result[0], list):
-                        first_inner = result[0]
-                        if len(first_inner) > 0 and isinstance(first_inner[0], list) and len(first_inner[0]) == 4:
-                            ocr_data = result[0]
-                        else:
-                            ocr_data = result
-                    else:
-                        ocr_data = result
-                else:
-                    self._log("OCR retornou lista vazia []")
-                    return []
-            
-            lines = []
-            for idx, line in enumerate(ocr_data):
-                if not isinstance(line, list) or len(line) < 2:
-                    continue
-                
-                text_info = line[1]
-                if not isinstance(text_info, tuple) and not isinstance(text_info, list):
-                    continue
-                
-                text = text_info[0].strip()
-                confidence = text_info[1]
-                
-                box = line[0]
-                y_pos = 0
-                if isinstance(box, list) and len(box) > 0:
-                    y_pos = int(box[0][1])
+            # === ADAPTADOR UNIVERSAL ===
+            # O objetivo é transformar 'result' em uma Lista de Linhas padronizada
+            raw_lines = []
 
-                if confidence > 0.4:
+            # Diagnóstico rápido do tipo
+            self._log(f"Result Type: {type(result)}")
+            if isinstance(result, list) and len(result) > 0:
+                self._log(f"Item[0] Type: {type(result[0])}")
+
+            # CASO 1: Lista de Listas (Padrão Antigo / Lista Plana)
+            # ex: [ [[box], (text, conf)], ... ]
+            if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list) and len(result[0]) == 2 and isinstance(result[0][1], tuple):
+                raw_lines = result
+            
+            # CASO 2: Aninhado (Padrão PaddleOCR Comum)
+            # ex: [ [ [[box], (text, conf)], ... ] ]
+            elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
+                 # Se o primeiro item é uma lista de listas, então result[0] é o que queremos
+                 raw_lines = result[0]
+            
+            # CASO 3: Objeto OCRResult (O caso atual!)
+            # Se result[0] não for lista, assumimos que é o objeto container.
+            # Vamos tentar iterar sobre ele ou sobre o próprio result se ele for o container.
+            elif isinstance(result, list) and len(result) == 1:
+                obj = result[0]
+                # Se for o objeto OCRResult, ele costuma ser iterável ou ter propriedades
+                # Tentamos converter para lista
+                try:
+                    raw_lines = list(obj)
+                except:
+                    # Se não der pra converter em lista, tentamos acessar atributos conhecidos
+                    # ou salvamos o dir() para debug
+                    self._log(f"Objeto nao iteravel. Atributos: {dir(obj)}")
+                    return []
+            else:
+                # Tenta iterar sobre o result direto
+                raw_lines = result
+
+            self._log(f"Raw Lines extraidas: {len(raw_lines)}")
+
+            # === PARSER DE LINHAS ===
+            lines = []
+            for item in raw_lines:
+                text = ""
+                confidence = 0.0
+                y_pos = 0
+                
+                # Tenta extrair de LISTA [box, (text, conf)]
+                if isinstance(item, list) and len(item) >= 2:
+                    # Pega Box
+                    if isinstance(item[0], list) and len(item[0]) > 0:
+                         y_pos = int(item[0][0][1])
+                    # Pega Texto
+                    if isinstance(item[1], tuple) or isinstance(item[1], list):
+                        text = item[1][0]
+                        confidence = item[1][1]
+                
+                # Tenta extrair de DICIONÁRIO {'text': ..., 'confidence': ..., 'box': ...}
+                elif isinstance(item, dict):
+                    text = item.get('text', '') or item.get('rec_text', '')
+                    confidence = item.get('confidence', 0) or item.get('score', 0) or item.get('rec_score', 0)
+                    box = item.get('box') or item.get('dt_boxes')
+                    if box: y_pos = int(box[0][1])
+
+                # Tenta extrair de OBJETO (atributos)
+                else:
+                    text = getattr(item, 'text', '') or getattr(item, 'rec_text', '')
+                    confidence = getattr(item, 'confidence', 0) or getattr(item, 'score', 0)
+                    # Tenta pegar box
+                    box = getattr(item, 'box', None) or getattr(item, 'dt_boxes', None)
+                    if box: y_pos = int(box[0][1])
+
+                if text and confidence > 0.4:
                     lines.append({
-                        'text': text,
+                        'text': text.strip(),
                         'confidence': round(confidence, 3),
                         'y_position': y_pos
                     })
-            
+
             lines.sort(key=lambda x: x['y_position'])
             
-            self._log(f"Linhas validas processadas: {len(lines)}")
+            self._log(f"Final Lines processadas: {len(lines)}")
             if len(lines) > 0:
                 self._log(f"Ex L0: {lines[0]['text']}")
                 
