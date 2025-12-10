@@ -62,17 +62,12 @@ class OCREngine:
         try:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None: 
-                self._log("Erro: Imagem invalida")
-                return []
+            if img is None: return []
             
             result = self.ocr.ocr(img) 
-            if result is None:
-                self._log("OCR retornou None.")
-                return []
+            if result is None: return []
 
-            # === PARSER DE ESTRUTURA ===
-            # Detecta formato PaddleX vs Lista
+            # PARSER DE ESTRUTURA
             first_obj = result[0] if isinstance(result, list) and len(result) > 0 else result
 
             def get_attr(obj, key):
@@ -85,9 +80,7 @@ class OCREngine:
 
             lines = []
 
-            # FORMATO PADDLEX (Listas Paralelas)
             if rec_texts and rec_scores and len(rec_texts) == len(rec_scores):
-                self._log(f"Formato: PaddleX ({len(rec_texts)} linhas)")
                 for i in range(len(rec_texts)):
                     text = rec_texts[i]
                     confidence = rec_scores[i]
@@ -96,32 +89,19 @@ class OCREngine:
                         poly = rec_polys[i]
                         if hasattr(poly, 'tolist'): poly = poly.tolist()
                         if len(poly) > 0:
-                            if isinstance(poly[0], list) or isinstance(poly[0], tuple) or hasattr(poly[0], 'shape'):
-                                y_pos = int(poly[0][1])
-                            elif len(poly) >= 2:
-                                y_pos = int(poly[1])
-                    
+                            if isinstance(poly[0], list) or isinstance(poly[0], tuple): y_pos = int(poly[0][1])
+                            elif len(poly) >= 2: y_pos = int(poly[1])
                     if text and float(confidence) > 0.4:
                         lines.append({'text': str(text).strip(), 'confidence': round(float(confidence), 3), 'y_position': y_pos})
-
-            # FORMATO LEGADO
             else:
-                self._log("Formato: Legado")
-                raw_lines = []
-                if isinstance(result, list):
-                    if len(result) > 0 and isinstance(result[0], list) and len(result[0]) == 2 and isinstance(result[0][1], tuple):
-                         raw_lines = result
-                    elif isinstance(result[0], list) and isinstance(result[0][0], list):
-                         raw_lines = result[0]
-                    else:
-                         if not get_attr(result[0], 'rec_texts'): raw_lines = result
-
+                # Fallback legado
+                raw_lines = result[0] if isinstance(result, list) and isinstance(result[0], list) and isinstance(result[0][0], list) else result
                 for item in raw_lines:
                     text = ""
                     confidence = 0.0
                     y_pos = 0
                     if isinstance(item, list) and len(item) >= 2:
-                        if isinstance(item[0], list) and len(item[0]) > 0: y_pos = int(item[0][0][1])
+                        if isinstance(item[0], list): y_pos = int(item[0][0][1])
                         if isinstance(item[1], tuple) or isinstance(item[1], list):
                             text = item[1][0]
                             confidence = item[1][1]
@@ -129,12 +109,8 @@ class OCREngine:
                         lines.append({'text': str(text).strip(), 'confidence': round(confidence, 3), 'y_position': y_pos})
 
             lines.sort(key=lambda x: x['y_position'])
-            self._log(f"Linhas finais: {len(lines)}")
             return lines
-
-        except Exception as e:
-            self._log(f"Erro FATAL extract_text: {str(e)}")
-            return []
+        except: return []
 
     def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
         full_text = '\n'.join([l['text'] for l in ocr_lines])
@@ -142,16 +118,14 @@ class OCREngine:
         
         itens = self._extract_items_smart(ocr_lines, full_text, tipo)
         
-        # Fallback apenas se Smart retornar zero itens
         if not itens:
-            self._log("Smart zero itens. Tentando Fallback X...")
             itens = self._extract_items_fallback_x(ocr_lines, full_text, tipo)
 
         return {
             "tipo_documento": tipo,
             "itens": itens,
             "qrcode_url": qr_data[0]['data'] if qr_data else None,
-            "mensagem": " | ".join(self.debug_log[-5:]) if not itens else None,
+            "mensagem": None,
             "confianca": 1.0 if itens else 0.0
         }
 
@@ -159,47 +133,31 @@ class OCREngine:
         data_compra = self._extract_date(full_text)
         itens = []
         
-        # Regex NFC-e: Inicio linha + (digitos ou C+digito) + espaco + digitos longos
         header_regex = re.compile(r'(?:^|\s)(?:\d{1,3}|C\d)\s+\d+')
         header_indices = [i for i, l in enumerate(lines) if header_regex.search(l['text'])]
-        
-        self._log(f"Indices: {header_indices}")
 
         for i, idx in enumerate(header_indices):
-            # === CORREÇÃO CRÍTICA DE JANELA ===
-            # Janela começa no índice ATUAL (idx). Nunca idx-1.
-            # Vai até o próximo índice de cabeçalho.
-            start_search = idx
+            start_search = idx # Começa na linha do nome
             
+            # Janela de busca segura
             if i + 1 < len(header_indices):
-                end_search = header_indices[i+1] # Para EXATAMENTE antes do próximo item
+                end_search = header_indices[i+1]
             else:
-                end_search = min(idx + 6, len(lines)) # Último item: olha 6 linhas pra frente
+                end_search = min(idx + 6, len(lines))
             
             search_lines = lines[start_search:end_search]
             block_text = " ".join([l['text'] for l in search_lines])
             
-            # Limpeza Nome
+            # Nome
             header_text = lines[idx]['text']
             nome = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', header_text) 
             nome = re.sub(r'\s+(KG|UN|LT|L)\s*$', '', nome, flags=re.IGNORECASE)
-            # Remove lixo do final se tiver X
             match_lixo = re.search(r'\s+[\d\.\,]*\s*(UN|KG|L|LT).*?[xX]', nome, re.IGNORECASE)
             if match_lixo: nome = nome[:match_lixo.start()]
             nome = nome.strip(" -.'\"") or "Produto"
 
             item = self._parse_block_values(block_text, nome, data_compra, tipo)
-            
-            if item: 
-                itens.append(item)
-            else:
-                # Se falhar usando a janela restrita, aí sim tentamos um "lookahead" suave
-                # Caso a linha de valores tenha ficado órfã logo abaixo do limite
-                if i + 1 < len(header_indices): # Só se não for o último
-                     extra_lines = lines[start_search : end_search + 1] # Pega +1 linha
-                     block_text_extra = " ".join([l['text'] for l in extra_lines])
-                     item_retry = self._parse_block_values(block_text_extra, nome, data_compra, tipo)
-                     if item_retry: itens.append(item_retry)
+            if item: itens.append(item)
 
         return itens
 
@@ -230,32 +188,45 @@ class OCREngine:
         qtd = 1.0
         unit = None
         
+        # Limpa caracteres comuns de erro OCR
         clean_block = block_text.replace('C', '0').replace('O', '0')
         
-        # Regex Qtd x Unit
-        m_full = re.search(r'([0-9]+[.,]?[0-9]*)\s*.*?[xX]\s*([0-9]+[.,][0-9]+)', clean_block, re.IGNORECASE)
+        # === CORREÇÃO AQUI ===
+        # Removemos o início da string que contém o código do item "01 0200..." 
+        # para que o regex de quantidade não capture o "01" ou "02" erroneamente.
+        # Removemos qualquer sequencia de digitos iniciais seguida de espaco
+        clean_block_no_header = re.sub(r'^(?:\d{1,3}|C\d)\s+\d+\s+', '', clean_block)
+
+        # Regex RIGOROSO: Exige unidade (UN/KG) ou 'x' explícito
+        # Não aceita número solto como quantidade na primeira tentativa
+        m_full = re.search(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|L|LT|PC)\s*[xX]\s*([0-9]+[.,][0-9]+)', clean_block_no_header, re.IGNORECASE)
+        
         if m_full:
             try:
                 qtd = float(m_full.group(1).replace(',', '.'))
                 unit = float(m_full.group(2).replace(',', '.'))
             except: pass
         else:
-            m_qtd = re.search(r'([0-9]+[.,]?[0-9]*)\s*(?:UN|KG|L|LT|PC)\b', clean_block, re.IGNORECASE)
-            if m_qtd: 
-                try: qtd = float(m_qtd.group(1).replace(',', '.'))
-                except: pass
+             # Tentativa 2: Procura 'X' sem unidade (ex: 0.116 x 94.99)
+             # Mas ignorando números inteiros pequenos no inicio (1, 2, 3...) que podem ser índice
+             m_x_simple = re.search(r'([0-9]+[.,][0-9]+)\s*[xX]\s*([0-9]+[.,][0-9]+)', clean_block_no_header, re.IGNORECASE)
+             if m_x_simple:
+                 try:
+                    qtd = float(m_x_simple.group(1).replace(',', '.'))
+                    unit = float(m_x_simple.group(2).replace(',', '.'))
+                 except: pass
 
         valor_total = None
 
         if unit is not None:
             valor_total = round(qtd * unit, 2)
         else:
-            # Caça ao total
             candidates = []
-            for val_str in re.findall(r'(\d+[.,]\d{2})', block_text):
+            for val_str in re.findall(r'(\d+[.,]\d{2})', clean_block_no_header):
                 try: candidates.append(float(val_str.replace(',', '.')))
                 except: pass
             
+            # Filtra valor igual à Qtd ou Unit
             valid_candidates = [c for c in candidates if abs(c - qtd) > 0.001]
             if valid_candidates: 
                 valor_total = valid_candidates[-1]
