@@ -161,10 +161,8 @@ class OCREngine:
         full_text = "\n".join([l["text"] for l in ocr_lines])
         tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
 
-        # 1) NOVO: parser por linha (para cupons tipo NFC-e SP)
         itens = self._extract_items_by_line(ocr_lines, tipo)
 
-        # 2) Se não achou nada, tenta o parser smart e depois o fallback antigo
         if not itens:
             itens = self._extract_items_smart(ocr_lines, full_text, tipo)
         if not itens:
@@ -178,50 +176,95 @@ class OCREngine:
             "confianca": 1.0 if itens else 0.0,
         }
 
+
     # ---------------- NOVO PARSER POR LINHA ----------------
 
     def _extract_items_by_line(self, lines: List[Dict], tipo: str) -> List[Dict]:
         """
-        Parser especializado para cupons NFC-e com padrão:
-        01 07891515546335 BATATA SADIA 1,05KG 1 UN x 15,89 T03 15,89
+        Extrai TODOS os itens da nota, ignorando o código de barras:
+        Linha típica (podendo estar quebrada em 2+ linhas pelo OCR):
+
+        01 07891515546335
+        BATATA SADIA 1,05KG 1 UN x 15,89 T03 15,89
         """
         data_compra = self._extract_date("\n".join(l["text"] for l in lines))
         itens: List[Dict] = []
 
+        # 1) Normaliza texto em ordem (só string)
+        raw = [l.get("text", "").strip() for l in lines if l.get("text")]
+
+        # 2) Agrupa em blocos por item
+        header_pat = re.compile(r'^\s*(\d{1,3})\s+(\d{8,14})\b')
+        blocks: List[str] = []
+        current: List[str] = []
+
+        for t in raw:
+            if header_pat.match(t):
+                # nova linha de item
+                if current:
+                    blocks.append(" ".join(current))
+                current = [t]
+            else:
+                # continuação (descrição / qtd / valores)
+                if current:
+                    current.append(t)
+        if current:
+            blocks.append(" ".join(current))
+
+        # 3) Para cada bloco, remove "NN CODIGO" e extrai desc, qtd, unit, total
+        # Formato esperado após prefixo:
+        # DESCRICAO ... QTD UN x V_UNIT [Txx] V_TOTAL
         line_regex = re.compile(
-            r'^\s*(\d{1,3})\s+'                  # índice
-            r'(\d{8,14})\s+'                     # EAN/código
-            r'(.+?)\s+'                          # descrição
-            r'(\d+[.,]?\d*)\s+'                  # quantidade
-            r'(UN|KG|L|LT|PC)\s+'                # unidade
+            r'^(?P<desc>.+?)\s+'                      # descrição (lazy)
+            r'(?P<qtd>\d+[.,]?\d*)\s+'                # quantidade
+            r'(?P<un>UN|KG|L|LT|PC)\s*'               # unidade
             r'[xX]\s*'
-            r'(\d+[.,]\d{2})\s+'                 # valor_unitário
-            r'(?:[A-Z0-9]{1,4}\s+)?'             # T03 etc (opcional)
-            r'(\d+[.,]\d{2})\s*$'                # valor_total
+            r'(?P<vunit>\d+[.,]\d{2})\s+'             # valor unitário
+            r'(?:[A-Z0-9]{1,4}\s+)?'                  # T03 etc (opcional)
+            r'(?P<vtotal>\d+[.,]\d{2})\s*$'           # valor total
         )
 
-        for l in lines:
-            text = l.get("text", "").strip()
-            m = line_regex.match(text)
+        for block in blocks:
+            # remove prefixo "NN CODIGO"
+            block_no_header = header_pat.sub("", block, count=1).strip()
+
+            m = line_regex.match(block_no_header)
             if not m:
+                # se não casar, tenta fallback leve: usar último número como total
+                numbers = re.findall(r'(\d+[.,]\d{2})', block_no_header)
+                if len(numbers) >= 1:
+                    vtotal = float(numbers[-1].replace(",", "."))
+                    # tentativa de achar unitário antes do total
+                    vunit = None
+                    if len(numbers) >= 2:
+                        vunit = float(numbers[-2].replace(",", "."))
+                    desc = self._clean_desc(block_no_header)
+                    itens.append({
+                        "item": desc,
+                        "quantidade": 1.0,
+                        "valor_unitario": vunit,
+                        "valor_total": vtotal,
+                        "data_compra": data_compra if tipo == "gasto" else None,
+                        "data_venda": data_compra if tipo == "venda" else None,
+                    })
                 continue
 
-            _, _ean, desc, qtd, un, v_unit, v_total = m.groups()
+            desc = self._clean_desc(m.group("desc"))
+            qtd = float(m.group("qtd").replace(",", "."))
+            vunit = float(m.group("vunit").replace(",", "."))
+            vtotal = float(m.group("vtotal").replace(",", "."))
 
-            desc = self._clean_desc(desc)
-
-            itens.append(
-                {
-                    "item": desc,
-                    "quantidade": float(qtd.replace(",", ".")),
-                    "valor_unitario": float(v_unit.replace(",", ".")),
-                    "valor_total": float(v_total.replace(",", ".")),
-                    "data_compra": data_compra if tipo == "gasto" else None,
-                    "data_venda": data_compra if tipo == "venda" else None,
-                }
-            )
+            itens.append({
+                "item": desc,
+                "quantidade": qtd,
+                "valor_unitario": vunit,
+                "valor_total": vtotal,
+                "data_compra": data_compra if tipo == "gasto" else None,
+                "data_venda": data_compra if tipo == "venda" else None,
+            })
 
         return itens
+
 
     def _clean_desc(self, desc: str) -> str:
         d = re.sub(r"\s+", " ", desc).strip().upper()
