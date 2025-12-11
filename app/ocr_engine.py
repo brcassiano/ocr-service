@@ -161,8 +161,10 @@ class OCREngine:
         full_text = "\n".join([l["text"] for l in ocr_lines])
         tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
 
+        # 1) Parser especializado por linha de item
         itens = self._extract_items_by_line(ocr_lines, tipo)
 
+        # 2) Fallbacks antigos (se nada foi encontrado)
         if not itens:
             itens = self._extract_items_smart(ocr_lines, full_text, tipo)
         if not itens:
@@ -177,45 +179,43 @@ class OCREngine:
         }
 
 
+
     # ---------------- NOVO PARSER POR LINHA ----------------
 
     def _extract_items_by_line(self, lines: List[Dict], tipo: str) -> List[Dict]:
         """
-        Extrai TODOS os itens da nota, ignorando o código de barras:
-        Linha típica (podendo estar quebrada em 2+ linhas pelo OCR):
+        Extrai todos os itens da NFC-e do supermercado, ignorando código de barras.
 
+        Layout típico:
         01 07891515546335
         BATATA SADIA 1,05KG 1 UN x 15,89 T03 15,89
         """
         data_compra = self._extract_date("\n".join(l["text"] for l in lines))
         itens: List[Dict] = []
 
-        # 1) Normaliza texto em ordem (só string)
+        # 1) normaliza textos em ordem
         raw = [l.get("text", "").strip() for l in lines if l.get("text")]
 
-        # 2) Agrupa em blocos por item
+        # 2) agrupa blocos por item
         header_pat = re.compile(r'^\s*(\d{1,3})\s+(\d{8,14})\b')
-        blocks: List[str] = []
-        current: List[str] = []
+        blocks: list[list[str]] = []
+        current: list[str] = []
 
         for t in raw:
             if header_pat.match(t):
-                # nova linha de item
                 if current:
-                    blocks.append(" ".join(current))
+                    blocks.append(current)
                 current = [t]
             else:
-                # continuação (descrição / qtd / valores)
+                # só agrega em bloco se já está dentro de um item
                 if current:
                     current.append(t)
         if current:
-            blocks.append(" ".join(current))
+            blocks.append(current)
 
-        # 3) Para cada bloco, remove "NN CODIGO" e extrai desc, qtd, unit, total
-        # Formato esperado após prefixo:
-        # DESCRICAO ... QTD UN x V_UNIT [Txx] V_TOTAL
+        # 3) regex para descrição + qtd + unitário + total
         line_regex = re.compile(
-            r'^(?P<desc>.+?)\s+'                      # descrição (lazy)
+            r'^(?P<desc>.+?)\s+'                      # descrição
             r'(?P<qtd>\d+[.,]?\d*)\s+'                # quantidade
             r'(?P<un>UN|KG|L|LT|PC)\s*'               # unidade
             r'[xX]\s*'
@@ -224,29 +224,30 @@ class OCREngine:
             r'(?P<vtotal>\d+[.,]\d{2})\s*$'           # valor total
         )
 
-        for block in blocks:
-            # remove prefixo "NN CODIGO"
-            block_no_header = header_pat.sub("", block, count=1).strip()
+        for block_lines in blocks:
+            # junta todas as linhas do item num único texto
+            full_block = " ".join(block_lines)
+            # remove o prefixo "NN CODIGO"
+            block_no_header = header_pat.sub("", full_block, count=1).strip()
 
+            # tenta casar com regex completo
             m = line_regex.match(block_no_header)
             if not m:
-                # se não casar, tenta fallback leve: usar último número como total
+                # fallback: tenta usar o maior trecho como nome e último número como total
                 numbers = re.findall(r'(\d+[.,]\d{2})', block_no_header)
-                if len(numbers) >= 1:
-                    vtotal = float(numbers[-1].replace(",", "."))
-                    # tentativa de achar unitário antes do total
-                    vunit = None
-                    if len(numbers) >= 2:
-                        vunit = float(numbers[-2].replace(",", "."))
-                    desc = self._clean_desc(block_no_header)
-                    itens.append({
-                        "item": desc,
-                        "quantidade": 1.0,
-                        "valor_unitario": vunit,
-                        "valor_total": vtotal,
-                        "data_compra": data_compra if tipo == "gasto" else None,
-                        "data_venda": data_compra if tipo == "venda" else None,
-                    })
+                if not numbers:
+                    continue
+                vtotal = float(numbers[-1].replace(",", "."))
+                vunit = float(numbers[-2].replace(",", ".")) if len(numbers) >= 2 else None
+                desc = self._clean_desc(block_no_header)
+                itens.append({
+                    "item": desc,
+                    "quantidade": 1.0,
+                    "valor_unitario": vunit,
+                    "valor_total": vtotal,
+                    "data_compra": data_compra if tipo == "gasto" else None,
+                    "data_venda": data_compra if tipo == "venda" else None,
+                })
                 continue
 
             desc = self._clean_desc(m.group("desc"))
@@ -266,14 +267,19 @@ class OCREngine:
         return itens
 
 
+
     def _clean_desc(self, desc: str) -> str:
+        # remove múltiplos espaços
         d = re.sub(r"\s+", " ", desc).strip().upper()
+        # remove qualquer sequência inicial “R$”, números soltos etc. que não façam sentido no nome
+        # mas NÃO remove "1,05KG" etc.
+        d = re.sub(r'^\d+\s+', '', d)
         d = re.sub(r"[^A-Z0-9À-Ü\s\-\.,/]", "", d)
-        # Correções manuais
         for wrong, right in self.COMMON_CORRECTIONS.items():
             if wrong in d:
                 d = d.replace(wrong, right)
         return d
+
 
     # ---------------- PARSERS ANTIGOS (mantidos para fallback) ----------------
 
