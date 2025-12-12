@@ -151,6 +151,8 @@ class OCREngine:
                         )
 
             lines.sort(key=lambda x: x["y_position"])
+            for l in lines:
+                self._log(f"OCR_LINE: y={l['y_position']} | {l['text']}")
             return lines
         except Exception:
             return []
