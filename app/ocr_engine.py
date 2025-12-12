@@ -218,17 +218,15 @@ class OCREngine:
             key=lambda x: x.get("y_position", 0),
         )
 
-        # Palavras-chave do rodapé para filtrar
         footer_keywords = ["VALOR TOTAL", "QTD. TOTAL", "CARTAO", "CONSUMIDOR", "HTTPS", "PROTOCOLO"]
         valid_lines = [
-            l for l in lines_sorted if not any(k in l.get("text", "").upper() for k in footer_keywords)
+            l for l in lines_sorted
+            if not any(k in l.get("text", "").upper() for k in footer_keywords)
         ]
 
         i = 0
         while i < len(valid_lines):
             text = valid_lines[i].get("text", "").strip().upper()
-            
-            # Detecta o início de um item (número de sequência + código)
             header = re.match(r"^\s*(\d{1,2})\s+(\d{8,14})", text)
             if not header:
                 i += 1
@@ -238,26 +236,23 @@ class OCREngine:
             block = [valid_lines[i]]
             j = i + 1
 
-            # ✅ CORREÇÃO 1: Aumentou de 12 para 28 pixels para capturar linhas "quebradas"
+            # AUMENTADO: 28 px para agrupar descrição + qtd + preços
             while j < len(valid_lines) and abs(valid_lines[j].get("y_position", 0) - y_base) <= 28:
                 block.append(valid_lines[j])
                 j += 1
 
             full_block = " ".join(b.get("text", "") for b in block)
-            # Remove o número de sequência e código no início
             block_clean = re.sub(r"^\s*\d{1,2}\s+\d{8,14}\s*", "", full_block).strip()
 
-            # ✅ CORREÇÃO 2: Regex adaptado para capturar layout com quebra de linhas
-            # Padrão: desc + qtd + UN + x (opcional) + valor_unitário + [código tributo] + valor_total
             m = re.search(
                 r"""
-                (.+?)                          # 1: descrição completa
-                \s+(\d+[.,]?\d*)               # 2: quantidade (1, 2, 3, 1,05 etc)
-                \s+(UN|KG|LT|PC|L|M)           # 3: unidade comercial
+                (.+?)                          # descrição completa
+                \s+(\d+[.,]?\d*)               # quantidade
+                \s+(UN|KG|LT|PC|L|M)           # unidade
                 (?:\s*[xX]\s*)?                # 'x' opcional
-                (\d+[.,]\d{2})                 # 4: valor unitário
-                (?:\s+[A-Z0-9]{1,4})?          # código T03/F opcional
-                \s+(\d+[.,]\d{2})              # 5: valor total
+                (\d+[.,]\d{2})                 # valor unitário
+                (?:\s+[A-Z0-9]{1,4})?          # T03/F opcional
+                \s+(\d+[.,]\d{2})              # valor total
                 """,
                 block_clean,
                 re.IGNORECASE | re.VERBOSE,
@@ -266,7 +261,6 @@ class OCREngine:
             if m:
                 desc_raw, qtd, un, v_unit, v_total = m.groups()
                 desc = self._clean_desc(desc_raw)
-
                 try:
                     itens.append({
                         "item": desc,
@@ -282,6 +276,7 @@ class OCREngine:
             i = j
 
         return itens
+
 
     def _clean_desc(self, desc: str) -> str:
         """Limpa a descrição removendo códigos, unidades, números, caracteres inválidos"""
