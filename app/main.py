@@ -1,312 +1,126 @@
-from paddleocr import PaddleOCR
-from pyzbar.pyzbar import decode
-import cv2
-import numpy as np
-import re
-from datetime import datetime
-from typing import List, Dict, Optional
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 import logging
-from .utils import TextProcessor
 
+from .ocr_engine import OCREngine
+from .models import OCRResponse, QRCodeResponse, HealthResponse
+from . import __version__
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+# Inicializar FastAPI
+app = FastAPI(
+    title="MEIre OCR Service",
+    description="Serviço de OCR especializado em comprovantes fiscais brasileiros",
+    version=__version__,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
-class OCREngine:
-    KEYWORDS_VENDA = ["recebido", "pix recebido", "crédito em conta", "depósito", "recibo"]
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    COMMON_CORRECTIONS = {
-        "ALHOTRADIC": "ALHO TRADIC",
-        "QJ": "QUEIJO",
-        "BATATA LAVADA": "BATATA LAVADA",
+# Inicializar OCR Engine
+ocr_engine: OCREngine | None = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Inicializa recursos na startup"""
+    global ocr_engine
+    logger.info("Iniciando MEIre OCR Service...")
+    try:
+        ocr_engine = OCREngine(use_gpu=False)
+        logger.info("OCR Engine inicializado com sucesso")
+    except Exception as e:
+        logger.error(f"Erro ao inicializar OCR Engine: {e}", exc_info=True)
+        raise
+
+
+@app.get("/", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "meire-ocr-service",
+        "version": __version__,
     }
 
-    def __init__(self, use_gpu: bool = False):
-        self.debug_log: List[str] = []
-        try:
-            params = {"use_angle_cls": False, "lang": "pt", "show_log": False}
-            if use_gpu:
-                params["use_gpu"] = True
-            self.ocr = PaddleOCR(**params)
-            self._log("✓ PaddleOCR inicializado")
-        except Exception:
-            self.ocr = PaddleOCR(lang="pt")
-            self._log("✓ PaddleOCR inicializado (fallback)")
-        self.text_processor = TextProcessor()
 
-    def _log(self, msg: str):
-        logger.info(msg)
-        self.debug_log.append(msg)
+@app.post("/api/ocr/comprovante")
+@app.post("/api/nfce/from-image")
+async def extract_comprovante(file: UploadFile = File(...)):
+    try:
+        if ocr_engine is None:
+            raise HTTPException(status_code=500, detail="OCR Engine não inicializado")
 
-    # ---------------- QR CODE ----------------
-    def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
-        try:
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                return None
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem")
 
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-            for _, processed in [
-                ("gray", gray),
-                ("thresh", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
-                ("clahe", cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)),
-                ("zoom", cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)),
-            ]:
-                decoded = decode(processed)
-                if decoded:
-                    for obj in decoded:
-                        if obj.type == "QRCODE":
-                            return [
-                                {
-                                    "data": obj.data.decode("utf-8", errors="ignore"),
-                                    "type": obj.type,
-                                }
-                            ]
+        qr_data = ocr_engine.extract_qrcode(image_bytes)
+        ocr_result = ocr_engine.extract_text(image_bytes)
 
-            detector = cv2.QRCodeDetector()
-            data, _, _ = detector.detectAndDecode(img)
-            if data:
-                return [{"data": data, "type": "QRCODE"}]
+        structured_data = ocr_engine.structure_data(ocr_result, qr_data)
 
-            return None
-        except Exception:
-            return None
+        # TEMPORÁRIO: devolver linhas brutas de OCR para debug
+        structured_data["ocr_raw_lines"] = ocr_result
 
-    # ---------------- OCR LINES ----------------
-    def extract_text(self, image_bytes: bytes) -> List[Dict]:
-        self.debug_log = []
-        try:
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                self._log("❌ IMG IS NONE")
-                return []
+        return JSONResponse(content=structured_data)
 
-            result = self.ocr.ocr(img)
-            if result is None:
-                self._log("❌ RESULT IS NONE")
-                return []
-
-            first_obj = result[0] if isinstance(result, list) and len(result) > 0 else result
-
-            def get_attr(obj, key):
-                if isinstance(obj, dict):
-                    return obj.get(key)
-                return getattr(obj, key, None)
-
-            rec_texts = get_attr(first_obj, "rec_texts")
-            rec_scores = get_attr(first_obj, "rec_scores")
-            rec_polys = get_attr(first_obj, "dt_polys") or get_attr(first_obj, "rec_polys")
-
-            lines: List[Dict] = []
-
-            if rec_texts and rec_scores and len(rec_texts) == len(rec_scores):
-                for i in range(len(rec_texts)):
-                    text = rec_texts[i]
-                    confidence = rec_scores[i]
-                    y_pos = 0
-                    if rec_polys and i < len(rec_polys):
-                        poly = rec_polys[i]
-                        if hasattr(poly, "tolist"):
-                            poly = poly.tolist()
-                        if len(poly) > 0:
-                            if isinstance(poly[0], (list, tuple)):
-                                y_pos = int(poly[0][1])
-                            elif len(poly) >= 2:
-                                y_pos = int(poly[1])
-                    if text and float(confidence) > 0.4:
-                        lines.append(
-                            {
-                                "text": str(text).strip(),
-                                "confidence": round(float(confidence), 3),
-                                "y_position": y_pos,
-                            }
-                        )
-            else:
-                raw_lines = (
-                    result[0]
-                    if isinstance(result, list)
-                    and isinstance(result[0], list)
-                    and isinstance(result[0][0], list)
-                    else result
-                )
-                for item in raw_lines or []:
-                    text = ""
-                    confidence = 0.0
-                    y_pos = 0
-                    if isinstance(item, list) and len(item) >= 2:
-                        if isinstance(item[0], list):
-                            y_pos = int(item[0][0][1])
-                        if isinstance(item[1], (tuple, list)):
-                            text = item[1][0]
-                            confidence = item[1][1]
-                    if text and confidence > 0.4:
-                        lines.append(
-                            {
-                                "text": str(text).strip(),
-                                "confidence": round(confidence, 3),
-                                "y_position": y_pos,
-                            }
-                        )
-
-            lines.sort(key=lambda x: x["y_position"])
-            return lines
-        except Exception as e:
-            self._log(f"❌ ERRO extract_text: {str(e)}")
-            return []
-
-    # ---------------- STRUCTURE DATA ----------------
-    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
-        if not ocr_lines:
-            return {
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            content={
                 "tipo_documento": "erro",
                 "itens": [],
-                "qrcode_url": qr_data[0]["data"] if qr_data else None,
-                "mensagem": "Nenhuma linha OCR encontrada",
+                "qrcode_url": None,
+                "mensagem": f"Erro interno: {str(e)}",
                 "confianca": 0.0,
-            }
-
-        full_text = "\n".join([l.get("text", "") for l in ocr_lines])
-        tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
-
-        itens = self._extract_items_by_line(ocr_lines, tipo)
-
-        return {
-            "tipo_documento": tipo,
-            "itens": itens,
-            "qrcode_url": qr_data[0]["data"] if qr_data else None,
-            "mensagem": None,
-            "confianca": 1.0 if itens else 0.0,
-        }
-
-    # ---------------- PARSER POR LINHA ----------------
-    def _extract_items_by_line(self, lines: List[Dict], tipo: str) -> List[Dict]:
-        """Extrai itens da NFC-e usando cabeçalho 'NN CÓDIGO' + bloco vertical."""
-        data_compra = self._extract_date("\n".join(l.get("text", "") for l in lines))
-        itens: List[Dict] = []
-
-        # Ordena por Y
-        lines_sorted = sorted(
-            [l for l in lines if isinstance(l, dict) and "text" in l],
-            key=lambda x: x.get("y_position", 0),
+            },
+            status_code=200,
         )
 
-        # Remove rodapé
-        footer_keywords = ["VALOR TOTAL", "QTD. TOTAL", "CARTAO", "CONSUMIDOR", "HTTPS", "PROTOCOLO"]
-        valid_lines = [
-            l for l in lines_sorted if not any(k in l.get("text", "").upper() for k in footer_keywords)
-        ]
 
-        i = 0
-        while i < len(valid_lines):
-            text = valid_lines[i].get("text", "").strip().upper()
-            # cabeçalho: "01 0789..." etc
-            header = re.match(r"^\s*(\d{1,2})\s+(\d{8,14})", text)
-            if not header:
-                i += 1
-                continue
+@app.post("/api/ocr/qrcode-only", response_model=QRCodeResponse)
+async def extract_qrcode_only(file: UploadFile = File(...)):
+    try:
+        if ocr_engine is None:
+            raise HTTPException(status_code=500, detail="OCR Engine não inicializado")
 
-            y_base = valid_lines[i].get("y_position", 0)
-            block = [valid_lines[i]]
-            j = i + 1
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Arquivo deve ser imagem")
 
-            # agrupa tudo que está próximo verticalmente (itens do mesmo bloco)
-            while j < len(valid_lines) and abs(valid_lines[j].get("y_position", 0) - y_base) <= 35:
-                block.append(valid_lines[j])
-                j += 1
+        image_bytes = await file.read()
+        qr_data = ocr_engine.extract_qrcode(image_bytes)
 
-            full_block = " ".join(b.get("text", "") for b in block)
-            # remove número e código iniciais
-            block_clean = re.sub(r"^\s*\d{1,2}\s+\d{8,14}\s*", "", full_block).strip()
+        if not qr_data:
+            return {"found": False, "data": None}
 
-            # descrição é tudo até antes do primeiro padrão "1 UN" ou preço
-            desc_match = re.match(
-                r"(.+?)(?:\s+\d+\s+UN|\s+\d+[.,]\d{2}|$)",
-                block_clean,
-                flags=re.IGNORECASE,
-            )
-            desc_raw = desc_match.group(1) if desc_match else block_clean
-            desc = self._clean_desc(desc_raw)
+        return {"found": True, "data": qr_data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro QR: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-            # preços no bloco
-            prices = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", block_clean)]
-            qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", block_clean, flags=re.IGNORECASE)
 
-            quantidade = 1.0
-            if qtd_match:
-                try:
-                    quantidade = float(qtd_match.group(1).replace(",", "."))
-                except ValueError:
-                    quantidade = 1.0
-
-            valor_unitario = None
-            valor_total = None
-
-            if prices:
-                # valor total: último preço do bloco
-                valor_total = prices[-1]
-                # valor unitário: o preço que aparece logo após um "x"
-                unit_match = re.search(
-                    r"[xX]\s*(\d+[.,]\d{2})",
-                    block_clean,
-                    flags=re.IGNORECASE,
-                )
-                if unit_match:
-                    try:
-                        valor_unitario = float(unit_match.group(1).replace(",", "."))
-                    except ValueError:
-                        valor_unitario = None
-                else:
-                    # fallback: se só tiver um preço, trata como total e tenta dividir
-                    if len(prices) == 1 and quantidade > 0:
-                        valor_total = prices[0]
-                        valor_unitario = round(valor_total / quantidade, 2)
-                    elif len(prices) >= 2:
-                        # penúltimo como unitário, último como total
-                        valor_unitario = prices[-2]
-                        valor_total = prices[-1]
-
-            itens.append(
-                {
-                    "item": desc,
-                    "quantidade": quantidade,
-                    "valor_unitario": valor_unitario,
-                    "valor_total": valor_total,
-                    "data_compra": data_compra if tipo == "gasto" else None,
-                    "data_venda": data_compra if tipo == "venda" else None,
-                }
-            )
-
-            i = j
-
-        return itens
-
-    def _clean_desc(self, desc: str) -> str:
-        if not desc:
-            return "ITEM DESCONHECIDO"
-
-        desc = re.sub(r"^\d+\s*", "", desc)
-        desc = re.sub(r"\s+(UN|KG|LT|PC|L|M)\s*$", "", desc, flags=re.IGNORECASE)
-        desc = re.sub(r"\s*[xX]\s*\d+[.,]\d{2}.*$", "", desc)
-        desc = re.sub(r"\s*(T\d{2,3}|F)\s*\d+[.,]\d{2}.*$", "", desc)
-        desc = re.sub(r"\s+", " ", desc).strip().upper()
-        desc = re.sub(r"[^A-Z0-9À-Ü\s\-\.,/]", "", desc)
-
-        for wrong, right in self.COMMON_CORRECTIONS.items():
-            if wrong in desc:
-                desc = desc.replace(wrong, right)
-
-        return desc if desc else "ITEM DESCONHECIDO"
-
-    # ---------------- DATA ----------------
-    def _extract_date(self, text: str) -> str:
-        patterns = [
-            r"emiss[aã]o[:\s]*(\d{2}/\d{2}/\d{4})",
-            r"(\d{2}/\d{2}/\d{4})",
-        ]
-        for p in patterns:
-            m = re.search(p, text, re.IGNORECASE)
-            if m:
-                return m.group(1)
-        return datetime.now().strftime("%d/%m/%Y")
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False, workers=2)
