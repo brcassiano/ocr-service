@@ -6,7 +6,6 @@ import re
 from datetime import datetime
 from typing import List, Dict, Optional
 import logging
-
 from .utils import TextProcessor
 
 logger = logging.getLogger(__name__)
@@ -14,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class OCREngine:
     KEYWORDS_VENDA = ["recebido", "pix recebido", "crédito em conta", "depósito", "recibo"]
-
+    
     COMMON_CORRECTIONS = {
         "ALHOTRADIC": "ALHO TRADIC",
         "QJ": "QUEIJO",
@@ -38,8 +37,7 @@ class OCREngine:
         logger.info(msg)
         self.debug_log.append(msg)
 
-    # ---------------- QR CODE ----------------
-
+    # ================ QR CODE ================
     def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
         try:
             nparr = np.frombuffer(image_bytes, np.uint8)
@@ -48,7 +46,8 @@ class OCREngine:
                 return None
 
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
+            
+            # Tenta múltiplas técnicas de processamento
             for _, processed in [
                 ("gray", gray),
                 ("thresh", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
@@ -66,20 +65,20 @@ class OCREngine:
                                 }
                             ]
 
+            # Fallback: usar detector nativo do OpenCV
             detector = cv2.QRCodeDetector()
             data, _, _ = detector.detectAndDecode(img)
             if data:
                 return [{"data": data, "type": "QRCODE"}]
+
             return None
         except Exception:
             return None
 
-    # ---------------- OCR LINES ----------------
-
+    # ================ OCR LINES ================
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
         self.debug_log = []
         self._log(f"=== extract_text INICIADO ===")
-        
         try:
             self._log("1. Decodificando imagem...")
             nparr = np.frombuffer(image_bytes, np.uint8)
@@ -87,8 +86,8 @@ class OCREngine:
             if img is None:
                 self._log("❌ IMG IS NONE")
                 return []
-            self._log(f"✅ Imagem OK: {img.shape}")
 
+            self._log(f"✅ Imagem OK: {img.shape}")
             self._log("2. Executando OCR...")
             result = self.ocr.ocr(img)
             self._log(f"✅ OCR result: {type(result)} len={len(result) if result else 0}")
@@ -120,6 +119,7 @@ class OCREngine:
                     text = rec_texts[i]
                     confidence = rec_scores[i]
                     y_pos = 0
+
                     if rec_polys and i < len(rec_polys):
                         poly = rec_polys[i]
                         if hasattr(poly, "tolist"):
@@ -129,7 +129,7 @@ class OCREngine:
                                 y_pos = int(poly[0][1])
                             elif len(poly) >= 2:
                                 y_pos = int(poly[1])
-                    
+
                     if text and float(confidence) > 0.4:
                         lines.append({
                             "text": str(text).strip(),
@@ -145,19 +145,23 @@ class OCREngine:
                     and isinstance(result[0][0], list)
                     else result
                 )
+
                 self._log(f"raw_lines type: {type(raw_lines)} len={len(raw_lines) if raw_lines else 0}")
+
                 for item_idx, item in enumerate(raw_lines or []):
                     text = ""
                     confidence = 0.0
                     y_pos = 0
+
                     if isinstance(item, list) and len(item) >= 2:
                         if isinstance(item[0], list):
                             y_pos = int(item[0][0][1])
                         if isinstance(item[1], (tuple, list)):
                             text = item[1][0]
                             confidence = item[1][1]
-                    
-                    self._log(f"RAW ITEM {item_idx}: '{text}' conf={confidence}")
+
+                        self._log(f"RAW ITEM {item_idx}: '{text}' conf={confidence}")
+
                     if text and confidence > 0.4:
                         lines.append({
                             "text": str(text).strip(),
@@ -166,23 +170,21 @@ class OCREngine:
                         })
 
             lines.sort(key=lambda x: x["y_position"])
+
             self._log(f"✅ FINAL: {len(lines)} linhas processadas")
-            
             for l_idx, l in enumerate(lines):
                 self._log(f"OCR_LINE {l_idx}: y={l['y_position']} | conf={l['confidence']} | '{l['text']}'")
-            
+
             self._log(f"=== extract_text FINALIZADO ===")
             return lines
-            
+
         except Exception as e:
             self._log(f"❌ ERRO extract_text: {str(e)}")
             import traceback
             self._log(traceback.format_exc())
             return []
 
-
-    # ---------------- STRUCTURE DATA ----------------
-
+    # ================ STRUCTURE DATA ================
     def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
         if not ocr_lines:
             return {
@@ -206,8 +208,7 @@ class OCREngine:
             "confianca": 1.0 if itens else 0.0,
         }
 
-    # ---------------- PARSER POR LINHA (NFC-e) ----------------
-
+    # ================ PARSER POR LINHA (NFC-e) ================
     def _extract_items_by_line(self, lines: List[Dict], tipo: str) -> List[Dict]:
         data_compra = self._extract_date("\n".join(l.get("text", "") for l in lines))
         itens: List[Dict] = []
@@ -217,6 +218,7 @@ class OCREngine:
             key=lambda x: x.get("y_position", 0),
         )
 
+        # Palavras-chave do rodapé para filtrar
         footer_keywords = ["VALOR TOTAL", "QTD. TOTAL", "CARTAO", "CONSUMIDOR", "HTTPS", "PROTOCOLO"]
         valid_lines = [
             l for l in lines_sorted if not any(k in l.get("text", "").upper() for k in footer_keywords)
@@ -225,7 +227,8 @@ class OCREngine:
         i = 0
         while i < len(valid_lines):
             text = valid_lines[i].get("text", "").strip().upper()
-
+            
+            # Detecta o início de um item (número de sequência + código)
             header = re.match(r"^\s*(\d{1,2})\s+(\d{8,14})", text)
             if not header:
                 i += 1
@@ -234,43 +237,45 @@ class OCREngine:
             y_base = valid_lines[i].get("y_position", 0)
             block = [valid_lines[i]]
             j = i + 1
-            while j < len(valid_lines) and abs(valid_lines[j].get("y_position", 0) - y_base) <= 12:
+
+            # ✅ CORREÇÃO 1: Aumentou de 12 para 28 pixels para capturar linhas "quebradas"
+            while j < len(valid_lines) and abs(valid_lines[j].get("y_position", 0) - y_base) <= 28:
                 block.append(valid_lines[j])
                 j += 1
 
             full_block = " ".join(b.get("text", "") for b in block)
+            # Remove o número de sequência e código no início
             block_clean = re.sub(r"^\s*\d{1,2}\s+\d{8,14}\s*", "", full_block).strip()
 
-            # desc + qtd + UN + x + v_unit + total (Txx opcional)
+            # ✅ CORREÇÃO 2: Regex adaptado para capturar layout com quebra de linhas
+            # Padrão: desc + qtd + UN + x (opcional) + valor_unitário + [código tributo] + valor_total
             m = re.search(
                 r"""
-                (.+?)                         # 1: descrição completa
-                \s+(\d+[.,]?\d*)              # 2: quantidade (1, 2, 3, 1,05 etc)
-                \s+(UN|KG|LT|PC)              # 3: unidade comercial
-                (?:\s*[xX]\s*)?               #   'x' opcional
-                (\d+[.,]\d{2})                # 4: valor unitário
-                (?:\s+[A-Z0-9]{1,4})?         #   código T03/F opcional
-                \s+(\d+[.,]\d{2})             # 5: valor total
+                (.+?)                          # 1: descrição completa
+                \s+(\d+[.,]?\d*)               # 2: quantidade (1, 2, 3, 1,05 etc)
+                \s+(UN|KG|LT|PC|L|M)           # 3: unidade comercial
+                (?:\s*[xX]\s*)?                # 'x' opcional
+                (\d+[.,]\d{2})                 # 4: valor unitário
+                (?:\s+[A-Z0-9]{1,4})?          # código T03/F opcional
+                \s+(\d+[.,]\d{2})              # 5: valor total
                 """,
                 block_clean,
                 re.IGNORECASE | re.VERBOSE,
             )
 
-
             if m:
                 desc_raw, qtd, un, v_unit, v_total = m.groups()
                 desc = self._clean_desc(desc_raw)
+
                 try:
-                    itens.append(
-                        {
-                            "item": desc,
-                            "quantidade": float(qtd.replace(",", ".")),
-                            "valor_unitario": float(v_unit.replace(",", ".")),
-                            "valor_total": float(v_total.replace(",", ".")),
-                            "data_compra": data_compra if tipo == "gasto" else None,
-                            "data_venda": data_compra if tipo == "venda" else None,
-                        }
-                    )
+                    itens.append({
+                        "item": desc,
+                        "quantidade": float(qtd.replace(",", ".")),
+                        "valor_unitario": float(v_unit.replace(",", ".")),
+                        "valor_total": float(v_total.replace(",", ".")),
+                        "data_compra": data_compra if tipo == "gasto" else None,
+                        "data_venda": data_compra if tipo == "venda" else None,
+                    })
                 except ValueError:
                     pass
 
@@ -279,29 +284,46 @@ class OCREngine:
         return itens
 
     def _clean_desc(self, desc: str) -> str:
+        """Limpa a descrição removendo códigos, unidades, números, caracteres inválidos"""
         if not desc:
             return "ITEM DESCONHECIDO"
 
+        # Remove números no início
         desc = re.sub(r"^\d+\s*", "", desc)
+        
+        # Remove unidades no final
         desc = re.sub(r"\s+(UN|KG|LT|PC|L|M)\s*$", "", desc, flags=re.IGNORECASE)
+        
+        # Remove 'x' seguido de valor (ex: x 15,89)
         desc = re.sub(r"\s*[xX]\s*\d+[.,]\d{2}.*$", "", desc)
+        
+        # Remove códigos de tributo e valores (ex: T03 15,89)
         desc = re.sub(r"\s*(T\d{2,3}|F)\s*\d+[.,]\d{2}.*$", "", desc)
-
+        
+        # Normaliza espaços
         desc = re.sub(r"\s+", " ", desc).strip().upper()
+        
+        # Remove caracteres especiais inválidos
         desc = re.sub(r"[^A-Z0-9À-Ü\s\-\.,/]", "", desc)
-
+        
+        # Aplica correções comuns
         for wrong, right in self.COMMON_CORRECTIONS.items():
             if wrong in desc:
                 desc = desc.replace(wrong, right)
 
         return desc if desc else "ITEM DESCONHECIDO"
 
-    # ---------------- DATA ----------------
-
+    # ================ DATA ================
     def _extract_date(self, text: str) -> str:
-        patterns = [r"emiss[aã]o[:\s]*(\d{2}/\d{2}/\d{4})", r"(\d{2}/\d{2}/\d{4})"]
+        """Extrai a data do documento (emissão)"""
+        patterns = [
+            r"emiss[aã]o[:\s]*(\d{2}/\d{2}/\d{4})",
+            r"(\d{2}/\d{2}/\d{4})"
+        ]
+        
         for p in patterns:
             m = re.search(p, text, re.IGNORECASE)
             if m:
                 return m.group(1)
+        
         return datetime.now().strftime("%d/%m/%Y")
