@@ -157,7 +157,7 @@ class OCREngine:
             return []
 
     # ---------------- STRUCTURE DATA ----------------
-    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict]:
+    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
         if not ocr_lines:
             return {
                 "tipo_documento": "erro",
