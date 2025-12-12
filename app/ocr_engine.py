@@ -78,17 +78,27 @@ class OCREngine:
 
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
         self.debug_log = []
+        self._log(f"=== extract_text INICIADO ===")
+        
         try:
+            self._log("1. Decodificando imagem...")
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
+                self._log("❌ IMG IS NONE")
                 return []
+            self._log(f"✅ Imagem OK: {img.shape}")
 
+            self._log("2. Executando OCR...")
             result = self.ocr.ocr(img)
+            self._log(f"✅ OCR result: {type(result)} len={len(result) if result else 0}")
+
             if result is None:
+                self._log("❌ RESULT IS NONE")
                 return []
 
             first_obj = result[0] if isinstance(result, list) and len(result) > 0 else result
+            self._log(f"first_obj type: {type(first_obj)}")
 
             def get_attr(obj, key):
                 if isinstance(obj, dict):
@@ -99,9 +109,13 @@ class OCREngine:
             rec_scores = get_attr(first_obj, "rec_scores")
             rec_polys = get_attr(first_obj, "dt_polys") or get_attr(first_obj, "rec_polys")
 
+            self._log(f"rec_texts: {type(rec_texts)} len={len(rec_texts) if rec_texts else 0}")
+            self._log(f"rec_scores: {type(rec_scores)} len={len(rec_scores) if rec_scores else 0}")
+
             lines: List[Dict] = []
 
             if rec_texts and rec_scores and len(rec_texts) == len(rec_scores):
+                self._log("✅ Usando modo rec_texts")
                 for i in range(len(rec_texts)):
                     text = rec_texts[i]
                     confidence = rec_scores[i]
@@ -115,15 +129,15 @@ class OCREngine:
                                 y_pos = int(poly[0][1])
                             elif len(poly) >= 2:
                                 y_pos = int(poly[1])
+                    
                     if text and float(confidence) > 0.4:
-                        lines.append(
-                            {
-                                "text": str(text).strip(),
-                                "confidence": round(float(confidence), 3),
-                                "y_position": y_pos,
-                            }
-                        )
+                        lines.append({
+                            "text": str(text).strip(),
+                            "confidence": round(float(confidence), 3),
+                            "y_position": y_pos,
+                        })
             else:
+                self._log("❌ Fallback legado")
                 raw_lines = (
                     result[0]
                     if isinstance(result, list)
@@ -131,7 +145,8 @@ class OCREngine:
                     and isinstance(result[0][0], list)
                     else result
                 )
-                for item in raw_lines:
+                self._log(f"raw_lines type: {type(raw_lines)} len={len(raw_lines) if raw_lines else 0}")
+                for item_idx, item in enumerate(raw_lines or []):
                     text = ""
                     confidence = 0.0
                     y_pos = 0
@@ -141,21 +156,30 @@ class OCREngine:
                         if isinstance(item[1], (tuple, list)):
                             text = item[1][0]
                             confidence = item[1][1]
+                    
+                    self._log(f"RAW ITEM {item_idx}: '{text}' conf={confidence}")
                     if text and confidence > 0.4:
-                        lines.append(
-                            {
-                                "text": str(text).strip(),
-                                "confidence": round(confidence, 3),
-                                "y_position": y_pos,
-                            }
-                        )
+                        lines.append({
+                            "text": str(text).strip(),
+                            "confidence": round(confidence, 3),
+                            "y_position": y_pos,
+                        })
 
             lines.sort(key=lambda x: x["y_position"])
-            for l in lines:
-                self._log(f"OCR_LINE: y={l['y_position']} | {l['text']}")
+            self._log(f"✅ FINAL: {len(lines)} linhas processadas")
+            
+            for l_idx, l in enumerate(lines):
+                self._log(f"OCR_LINE {l_idx}: y={l['y_position']} | conf={l['confidence']} | '{l['text']}'")
+            
+            self._log(f"=== extract_text FINALIZADO ===")
             return lines
-        except Exception:
+            
+        except Exception as e:
+            self._log(f"❌ ERRO extract_text: {str(e)}")
+            import traceback
+            self._log(traceback.format_exc())
             return []
+
 
     # ---------------- STRUCTURE DATA ----------------
 
