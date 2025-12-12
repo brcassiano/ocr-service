@@ -1,11 +1,17 @@
 from paddleocr import PaddleOCR
 from pyzbar.pyzbar import decode
+
 import cv2
 import numpy as np
+
 import re
+
 from datetime import datetime
+
 from typing import List, Dict, Optional
+
 import logging
+
 from .utils import TextProcessor
 
 logger = logging.getLogger(__name__)
@@ -31,6 +37,7 @@ class OCREngine:
         except Exception:
             self.ocr = PaddleOCR(lang="pt")
             self._log("✓ PaddleOCR inicializado (fallback)")
+
         self.text_processor = TextProcessor()
 
     def _log(self, msg: str):
@@ -106,6 +113,7 @@ class OCREngine:
                     text = rec_texts[i]
                     confidence = rec_scores[i]
                     y_pos = 0
+
                     if rec_polys and i < len(rec_polys):
                         poly = rec_polys[i]
                         if hasattr(poly, "tolist"):
@@ -115,6 +123,7 @@ class OCREngine:
                                 y_pos = int(poly[0][1])
                             elif len(poly) >= 2:
                                 y_pos = int(poly[1])
+
                     if text and float(confidence) > 0.4:
                         lines.append(
                             {
@@ -131,16 +140,19 @@ class OCREngine:
                     and isinstance(result[0][0], list)
                     else result
                 )
+
                 for item in raw_lines or []:
                     text = ""
                     confidence = 0.0
                     y_pos = 0
+
                     if isinstance(item, list) and len(item) >= 2:
                         if isinstance(item[0], list):
                             y_pos = int(item[0][0][1])
                         if isinstance(item[1], (tuple, list)):
                             text = item[1][0]
                             confidence = item[1][1]
+
                     if text and confidence > 0.4:
                         lines.append(
                             {
@@ -152,6 +164,7 @@ class OCREngine:
 
             lines.sort(key=lambda x: x["y_position"])
             return lines
+
         except Exception as e:
             self._log(f"❌ ERRO extract_text: {str(e)}")
             return []
@@ -170,7 +183,17 @@ class OCREngine:
         full_text = "\n".join([l.get("text", "") for l in ocr_lines])
         tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
 
-        itens = self._extract_items_by_header_blocks(ocr_lines, tipo)
+        # Remove rodapé a partir de "QTD. TOTAL DE ITENS" ou "VALOR TOTAL (R$)"
+        cleaned_lines: List[Dict] = []
+        stop = False
+        for l in ocr_lines:
+            t = l.get("text", "").upper()
+            if "QTD. TOTAL DE ITENS" in t or "VALOR TOTAL (R$)" in t:
+                stop = True
+            if not stop:
+                cleaned_lines.append(l)
+
+        itens = self._extract_items_by_header_blocks(cleaned_lines, tipo)
 
         return {
             "tipo_documento": tipo,
@@ -183,26 +206,24 @@ class OCREngine:
     # ---------------- PARSER POR CABEÇALHO NN CÓDIGO ----------------
     def _extract_items_by_header_blocks(self, lines: List[Dict], tipo: str) -> List[Dict]:
         """
-        Parser por blocos com cabeçalho 'NN CÓDIGO'.
-        Cada item é delimitado por linhas que começam com:
-        NN CCCCCCCCCCCCCC   (NN = 1-2 dígitos, CÓDIGO = 8-14 dígitos)
+        Usa exclusivamente linhas que começam com 'NN CÓDIGO' como
+        delimitadores de bloco de item. Cada bloco é [header_i, header_{i+1}).
+
         Dentro do bloco:
-        - descrição: primeira linha com letras depois do cabeçalho;
-        - quantidade: do padrão '(\d+[.,]?\d*)\s*UN';
-        - unitário: número depois de 'x' na mesma linha da quantidade;
-        - total: se houver dois preços na linha da quantidade (total e unit), usa o primeiro como total.
-            Caso contrário, assume total = quantidade * unitário.
-        Ignora linhas globais como 'VALOR TOTAL (R$) 236,09'.
+        - descrição: primeira linha com letras que não seja UN/X/F nem só preço;
+        - quantidade: padrão '(\\d+[.,]?\\d*) UN' em alguma linha do bloco;
+        - unitário: valor após 'x' na linha da quantidade;
+        - total: preço na mesma linha da quantidade ou, em fallback,
+                 maior preço dentro do bloco (sem rodapé).
         """
-        # data da compra a partir do texto total
         data_compra = self._extract_date("\n".join(l.get("text", "") for l in lines))
         itens: List[Dict] = []
 
-        # só texto, na ordem
+        # só texto, preservando ordem original
         texts = [l.get("text", "") for l in lines]
 
-        # localizar cabeçalhos de item (NN CÓDIGO)
-        header_indices = []
+        # índices de cabeçalho
+        header_indices: List[int] = []
         header_pattern = re.compile(r"^\s*(\d{1,2})\s+(\d{8,14})")
 
         for idx, text in enumerate(texts):
@@ -212,34 +233,30 @@ class OCREngine:
         if not header_indices:
             return []
 
-        # sentinela final
-        header_indices.append(len(texts))
+        header_indices.append(len(texts))  # sentinela final
 
         for h in range(len(header_indices) - 1):
             start = header_indices[h]
             end = header_indices[h + 1]
             block_lines = texts[start:end]
-
             if not block_lines:
                 continue
 
-            # remove "NN CÓDIGO" da primeira linha do bloco
+            # remove o cabeçalho 'NN CODIGO' da primeira linha
             first = header_pattern.sub("", block_lines[0]).strip()
             block_rest = [first] + block_lines[1:]
 
-            # 1) Descrição: primeira linha com letras, não sendo apenas UN/X/F/-
+            # descrição: primeira linha com letras que não seja UN/X/F e não seja só preço
             desc_raw = None
             for t in block_rest:
                 t_stripped = t.strip()
                 if not t_stripped:
                     continue
-                # precisa ter alguma letra
                 if not re.search(r"[A-Za-zÀ-Ü]", t_stripped):
                     continue
                 upper = t_stripped.upper()
                 if upper in {"UN", "X", "F", "-"}:
                     continue
-                # se for só preço, pula
                 if re.fullmatch(r"\d+[.,]\d{2}", t_stripped):
                     continue
                 desc_raw = t_stripped
@@ -247,11 +264,12 @@ class OCREngine:
 
             desc = self._clean_desc(desc_raw or "")
 
-            # 2) Linha de quantidade: a linha que contém "UN" com quantidade antes
+            # --------------- QUANTIDADE / UNITÁRIO / TOTAL ---------------
             quantidade = 1.0
             valor_unitario = None
             valor_total = None
 
+            # linha de quantidade = primeira com " UN"
             qtd_line = None
             for t in block_rest:
                 if re.search(r"\bUN\b", t, flags=re.IGNORECASE):
@@ -259,7 +277,7 @@ class OCREngine:
                     break
 
             if qtd_line:
-                # extrai quantidade
+                # quantidade
                 qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", qtd_line, flags=re.IGNORECASE)
                 if qtd_match:
                     try:
@@ -267,10 +285,13 @@ class OCREngine:
                     except ValueError:
                         quantidade = 1.0
 
-                # preços na linha de quantidade
-                prices_in_qtd_line = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", qtd_line)]
+                # preços nessa linha
+                prices_in_qtd = [
+                    float(p.replace(",", "."))
+                    for p in re.findall(r"\d+[.,]\d{2}", qtd_line)
+                ]
 
-                # se houver "x num"
+                # unitário após 'x'
                 unit_match = re.search(r"[xX]\s*(\d+[.,]\d{2})", qtd_line)
                 if unit_match:
                     try:
@@ -278,34 +299,26 @@ class OCREngine:
                     except ValueError:
                         valor_unitario = None
 
-                # se a linha tiver dois preços tipo "15,89" e "x 8,99", assume primeiro como total
-                if len(prices_in_qtd_line) >= 2:
-                    # a maioria dos cupons tem padrão:
-                    #   TOTAL
-                    #   F
-                    #   1 UN x UNIT
-                    # mas alguns colocam na mesma linha. Ajuste se necessário.
-                    # aqui: se tiver 2 preços, o primeiro vira total, o segundo unit
-                    if valor_unitario is None and len(prices_in_qtd_line) == 2:
-                        valor_total = prices_in_qtd_line[0]
-                        valor_unitario = prices_in_qtd_line[1]
-                    elif valor_unitario is not None and valor_total is None:
-                        # já temos unitário via 'x'; se ainda tiver preço antes dele, usa como total
-                        valor_total = prices_in_qtd_line[0]
-                elif len(prices_in_qtd_line) == 1 and valor_unitario is None:
-                    # só um preço na linha e sem 'x': assume que é total (casos raros)
-                    valor_total = prices_in_qtd_line[0]
+                # se tiver 2 preços na linha e já temos unitário, assume primeiro como total
+                if len(prices_in_qtd) >= 2 and valor_unitario is not None and valor_total is None:
+                    valor_total = prices_in_qtd[0]
+                elif len(prices_in_qtd) == 1 and valor_unitario is None:
+                    # só um preço na linha, sem 'x': assume total
+                    valor_total = prices_in_qtd[0]
 
-            # 3) fallback: se ainda não tiver total, tenta pegar o maior preço do bloco
+            # fallback: se ainda não tiver total, procura preços nas linhas do bloco
+            # (já sem rodapé, pois foi cortado em structure_data)
             if valor_total is None:
-                # evita pegar o total geral da nota: só olha as linhas do bloco exceto as últimas globais
-                block_text = " ".join(block_rest)
-                prices_block = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", block_text)]
+                safe_text = " ".join(block_rest)
+                prices_block = [
+                    float(p.replace(",", "."))
+                    for p in re.findall(r"\d+[.,]\d{2}", safe_text)
+                ]
                 if prices_block:
-                    # normalmente o maior preço do bloco será o total do item (quando é KG etc.)
+                    # normalmente o maior preço do bloco é o total do item (ex: produtos a peso)
                     valor_total = max(prices_block)
 
-            # 4) se ainda não tiver unitário e tiver total + quantidade, calcula
+            # se ainda não tiver unitário e tiver total + quantidade
             if valor_unitario is None and valor_total is not None and quantidade > 0:
                 valor_unitario = round(valor_total / quantidade, 2)
 
@@ -322,7 +335,6 @@ class OCREngine:
 
         return itens
 
-
     def _clean_desc(self, desc: str) -> str:
         if not desc:
             return "ITEM DESCONHECIDO"
@@ -332,7 +344,11 @@ class OCREngine:
         desc = re.sub(r"\s*[xX]\s*\d+[.,]\d{2}.*$", "", desc)
         desc = re.sub(r"\s*(T\d{2,3}|F)\s*\d+[.,]\d{2}.*$", "", desc)
         desc = re.sub(r"\s+", " ", desc).strip().upper()
-        desc = re.sub(r"[^A-Z0-9À-Ü\s\-\.,/]", "", desc)
+        desc = re.sub(r"[^A-Z0-9À-Ü\s\-.,/]", "", desc)
+
+        # se sobrou só UN/X/F/-, trata como desconhecido
+        if desc in {"UN", "X", "F", "-"}:
+            return "ITEM DESCONHECIDO"
 
         for wrong, right in self.COMMON_CORRECTIONS.items():
             if wrong in desc:
@@ -346,8 +362,10 @@ class OCREngine:
             r"emiss[aã]o[:\s]*(\d{2}/\d{2}/\d{4})",
             r"(\d{2}/\d{2}/\d{4})",
         ]
+
         for p in patterns:
             m = re.search(p, text, re.IGNORECASE)
             if m:
                 return m.group(1)
+
         return datetime.now().strftime("%d/%m/%Y")
