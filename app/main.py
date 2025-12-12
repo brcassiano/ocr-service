@@ -60,14 +60,12 @@ async def health_check():
     }
 
 
-@app.post("/api/ocr/comprovante", response_model=OCRResponse)
-@app.post("/api/nfce/from-image", response_model=OCRResponse)
+@app.post("/api/ocr/comprovante")
+@app.post("/api/nfce/from-image")
 async def extract_comprovante(file: UploadFile = File(...)):
     try:
         if ocr_engine is None:
             raise HTTPException(status_code=500, detail="OCR Engine não inicializado")
-
-        logger.info(f"Processando arquivo: {file.filename} ({file.content_type})")
 
         if not file.content_type or not file.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem")
@@ -76,37 +74,19 @@ async def extract_comprovante(file: UploadFile = File(...)):
         if not image_bytes:
             raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-        logger.info(f"Imagem carregada: {len(image_bytes)} bytes")
-
-        # 1. Tentar extrair QR Code
         qr_data = ocr_engine.extract_qrcode(image_bytes)
-
-        # 2. Executar OCR completo
         ocr_result = ocr_engine.extract_text(image_bytes)
 
-        # LOGS DAS LINHAS RAW DO OCR
-        for l in ocr_result:
-            logger.info(
-                "OCR_RAW_LINE y=%s conf=%s text='%s'",
-                l.get("y_position"),
-                l.get("confidence"),
-                l.get("text"),
-            )
-
-        # 3. Estruturar dados
         structured_data = ocr_engine.structure_data(ocr_result, qr_data)
 
-        logger.info(
-            "Processamento concluído: %d itens",
-            len(structured_data.get("itens", [])),
-        )
+        # TEMPORÁRIO: devolver linhas brutas de OCR para debug
+        structured_data["ocr_raw_lines"] = ocr_result
 
         return JSONResponse(content=structured_data)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro ao processar comprovante: {str(e)}", exc_info=True)
         return JSONResponse(
             content={
                 "tipo_documento": "erro",
