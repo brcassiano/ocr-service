@@ -180,29 +180,28 @@ class OCREngine:
             "confianca": 1.0 if itens else 0.0,
         }
 
-    # ---------------- PARSER POR LINHA ----------------
+    # ---------------- PARSER POR LINHA (NFC-e) ----------------
     def _extract_items_by_line(self, lines: List[Dict], tipo: str) -> List[Dict]:
-        """Extrai itens da NFC-e usando cabeçalho 'NN CÓDIGO' + bloco vertical."""
         data_compra = self._extract_date("\n".join(l.get("text", "") for l in lines))
         itens: List[Dict] = []
 
-        # Ordena por Y
         lines_sorted = sorted(
             [l for l in lines if isinstance(l, dict) and "text" in l],
             key=lambda x: x.get("y_position", 0),
         )
 
-        # Remove rodapé
         footer_keywords = ["VALOR TOTAL", "QTD. TOTAL", "CARTAO", "CONSUMIDOR", "HTTPS", "PROTOCOLO"]
         valid_lines = [
-            l for l in lines_sorted if not any(k in l.get("text", "").upper() for k in footer_keywords)
+            l for l in lines_sorted
+            if not any(k in l.get("text", "").upper() for k in footer_keywords)
         ]
 
         i = 0
         while i < len(valid_lines):
             text = valid_lines[i].get("text", "").strip().upper()
-            # cabeçalho: "01 0789..." etc
-            header = re.match(r"^\s*(\d{1,2})\s+(\d{8,14})", text)
+
+            # aceita cabeçalho 'NN CODIGO' em qualquer parte da linha
+            header = re.search(r"\b(\d{1,2})\s+(\d{8,14})\b", text)
             if not header:
                 i += 1
                 continue
@@ -211,28 +210,26 @@ class OCREngine:
             block = [valid_lines[i]]
             j = i + 1
 
-            # agrupa tudo que está próximo verticalmente (itens do mesmo bloco)
-            while j < len(valid_lines) and abs(valid_lines[j].get("y_position", 0) - y_base) <= 35:
+            # janela vertical um pouco menor para não misturar itens
+            while j < len(valid_lines) and abs(valid_lines[j].get("y_position", 0) - y_base) <= 25:
                 block.append(valid_lines[j])
                 j += 1
 
             full_block = " ".join(b.get("text", "") for b in block)
-            # remove número e código iniciais
-            block_clean = re.sub(r"^\s*\d{1,2}\s+\d{8,14}\s*", "", full_block).strip()
+            block_clean = re.sub(r"\b\d{1,2}\s+\d{8,14}\b", "", full_block).strip()
 
-            # descrição é tudo até antes do primeiro padrão "1 UN" ou preço
-            desc_match = re.match(
-                r"(.+?)(?:\s+\d+\s+UN|\s+\d+[.,]\d{2}|$)",
+            # descrição: primeira sequência de letras/números antes da parte numérica
+            desc_match = re.search(
+                r"([A-Z0-9À-Ü][A-Z0-9À-Ü\s\.,/]+?)(?=\s+\d+\s+UN|\s+\d+[.,]\d{2}|$)",
                 block_clean,
                 flags=re.IGNORECASE,
             )
             desc_raw = desc_match.group(1) if desc_match else block_clean
             desc = self._clean_desc(desc_raw)
 
-            # preços no bloco
             prices = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", block_clean)]
-            qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", block_clean, flags=re.IGNORECASE)
 
+            qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", block_clean, flags=re.IGNORECASE)
             quantidade = 1.0
             if qtd_match:
                 try:
@@ -244,9 +241,8 @@ class OCREngine:
             valor_total = None
 
             if prices:
-                # valor total: último preço do bloco
                 valor_total = prices[-1]
-                # valor unitário: o preço que aparece logo após um "x"
+
                 unit_match = re.search(
                     r"[xX]\s*(\d+[.,]\d{2})",
                     block_clean,
@@ -258,12 +254,10 @@ class OCREngine:
                     except ValueError:
                         valor_unitario = None
                 else:
-                    # fallback: se só tiver um preço, trata como total e tenta dividir
                     if len(prices) == 1 and quantidade > 0:
                         valor_total = prices[0]
                         valor_unitario = round(valor_total / quantidade, 2)
                     elif len(prices) >= 2:
-                        # penúltimo como unitário, último como total
                         valor_unitario = prices[-2]
                         valor_total = prices[-1]
 
