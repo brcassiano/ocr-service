@@ -153,6 +153,8 @@ class OCREngine:
             
             search_lines = lines[start_search:end_search]
             block_text = " ".join([l['text'] for l in search_lines])
+
+            self._log(f"SMART_BLOCK idx={idx}: '{block_text}'")
             
             # Pega nome bruto
             header_text = lines[idx]['text']
@@ -213,6 +215,7 @@ class OCREngine:
         return text
 
     def _parse_block_values(self, block_text, nome, data_compra, tipo):
+        self._log(f"PARSE_BLOCK nome='{nome}' raw='{block_text}'")
         qtd = 1.0
         unit = None
         

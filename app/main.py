@@ -61,11 +61,8 @@ async def health_check():
 
 
 @app.post("/api/ocr/comprovante", response_model=OCRResponse)
-@app.post("/api/nfce/from-image", response_model=OCRResponse)  # Alias para compatibilidade
+@app.post("/api/nfce/from-image", response_model=OCRResponse)
 async def extract_comprovante(file: UploadFile = File(...)):
-    """
-    Extrai dados estruturados de comprovantes fiscais brasileiros.
-    """
     try:
         if ocr_engine is None:
             raise HTTPException(status_code=500, detail="OCR Engine não inicializado")
@@ -87,10 +84,22 @@ async def extract_comprovante(file: UploadFile = File(...)):
         # 2. Executar OCR completo
         ocr_result = ocr_engine.extract_text(image_bytes)
 
+        # LOGS DAS LINHAS RAW DO OCR
+        for l in ocr_result:
+            logger.info(
+                "OCR_RAW_LINE y=%s conf=%s text='%s'",
+                l.get("y_position"),
+                l.get("confidence"),
+                l.get("text"),
+            )
+
         # 3. Estruturar dados
         structured_data = ocr_engine.structure_data(ocr_result, qr_data)
 
-        logger.info(f"Processamento concluído: {len(structured_data.get('itens', []))} itens")
+        logger.info(
+            "Processamento concluído: %d itens",
+            len(structured_data.get("itens", [])),
+        )
 
         return JSONResponse(content=structured_data)
 
