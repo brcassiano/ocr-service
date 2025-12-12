@@ -243,10 +243,19 @@ class OCREngine:
 
             # desc + qtd + UN + x + v_unit + total (Txx opcional)
             m = re.search(
-                r"(.+?)\s+(\d+[.,]?\d*)\s+(UN|KG|LT|PC)\s*[xX]?\s*(\d+[.,]\d{2})\s+(?:[A-Z0-9]{1,4}\s+)?(\d+[.,]\d{2})",
+                r"""
+                (.+?)                         # 1: descrição completa
+                \s+(\d+[.,]?\d*)              # 2: quantidade (1, 2, 3, 1,05 etc)
+                \s+(UN|KG|LT|PC)              # 3: unidade comercial
+                (?:\s*[xX]\s*)?               #   'x' opcional
+                (\d+[.,]\d{2})                # 4: valor unitário
+                (?:\s+[A-Z0-9]{1,4})?         #   código T03/F opcional
+                \s+(\d+[.,]\d{2})             # 5: valor total
+                """,
                 block_clean,
-                re.IGNORECASE,
+                re.IGNORECASE | re.VERBOSE,
             )
+
 
             if m:
                 desc_raw, qtd, un, v_unit, v_total = m.groups()
