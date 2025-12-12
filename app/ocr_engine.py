@@ -183,21 +183,25 @@ class OCREngine:
     # ---------------- PARSER POR CABEÇALHO NN CÓDIGO ----------------
     def _extract_items_by_header_blocks(self, lines: List[Dict], tipo: str) -> List[Dict]:
         """
-        Usa exclusivamente linhas que começam com 'NN CÓDIGO' como
-        delimitadores de bloco de item. Cada bloco é [header_i, header_{i+1}).
+        Parser por blocos com cabeçalho 'NN CÓDIGO'.
+        Cada item é delimitado por linhas que começam com:
+        NN CCCCCCCCCCCCCC   (NN = 1-2 dígitos, CÓDIGO = 8-14 dígitos)
         Dentro do bloco:
-          - descrição: primeira linha com letras que não seja UN/X/F nem só preço;
-          - quantidade: padrão '(\d+[.,]?\d*) UN';
-          - unitário: valor após 'x';
-          - total: último preço simples do bloco.
+        - descrição: primeira linha com letras depois do cabeçalho;
+        - quantidade: do padrão '(\d+[.,]?\d*)\s*UN';
+        - unitário: número depois de 'x' na mesma linha da quantidade;
+        - total: se houver dois preços na linha da quantidade (total e unit), usa o primeiro como total.
+            Caso contrário, assume total = quantidade * unitário.
+        Ignora linhas globais como 'VALOR TOTAL (R$) 236,09'.
         """
+        # data da compra a partir do texto total
         data_compra = self._extract_date("\n".join(l.get("text", "") for l in lines))
         itens: List[Dict] = []
 
-        # só texto, preservando ordem original
+        # só texto, na ordem
         texts = [l.get("text", "") for l in lines]
 
-        # índices de cabeçalho
+        # localizar cabeçalhos de item (NN CÓDIGO)
         header_indices = []
         header_pattern = re.compile(r"^\s*(\d{1,2})\s+(\d{8,14})")
 
@@ -208,26 +212,34 @@ class OCREngine:
         if not header_indices:
             return []
 
-        header_indices.append(len(texts))  # sentinela final
+        # sentinela final
+        header_indices.append(len(texts))
 
         for h in range(len(header_indices) - 1):
             start = header_indices[h]
             end = header_indices[h + 1]
             block_lines = texts[start:end]
 
-            # remove o cabeçalho 'NN CODIGO' da primeira linha
+            if not block_lines:
+                continue
+
+            # remove "NN CÓDIGO" da primeira linha do bloco
             first = header_pattern.sub("", block_lines[0]).strip()
             block_rest = [first] + block_lines[1:]
 
-            # descrição: primeira linha com letras que não seja UN/X/F e não seja só preço
+            # 1) Descrição: primeira linha com letras, não sendo apenas UN/X/F/-
             desc_raw = None
             for t in block_rest:
                 t_stripped = t.strip()
+                if not t_stripped:
+                    continue
+                # precisa ter alguma letra
                 if not re.search(r"[A-Za-zÀ-Ü]", t_stripped):
                     continue
                 upper = t_stripped.upper()
                 if upper in {"UN", "X", "F", "-"}:
                     continue
+                # se for só preço, pula
                 if re.fullmatch(r"\d+[.,]\d{2}", t_stripped):
                     continue
                 desc_raw = t_stripped
@@ -235,39 +247,67 @@ class OCREngine:
 
             desc = self._clean_desc(desc_raw or "")
 
-            # junta bloco em uma string para regex de números
-            block_text = " ".join(block_rest)
-
-            # quantidade
+            # 2) Linha de quantidade: a linha que contém "UN" com quantidade antes
             quantidade = 1.0
-            qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", block_text, flags=re.IGNORECASE)
-            if qtd_match:
-                try:
-                    quantidade = float(qtd_match.group(1).replace(",", "."))
-                except ValueError:
-                    quantidade = 1.0
-
-            # unitário (após 'x')
             valor_unitario = None
-            unit_match = re.search(r"[xX]\s*(\d+[.,]\d{2})", block_text, flags=re.IGNORECASE)
-            if unit_match:
-                try:
-                    valor_unitario = float(unit_match.group(1).replace(",", "."))
-                except ValueError:
-                    valor_unitario = None
-
-            # preços simples no bloco
-            prices = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", block_text)]
             valor_total = None
-            if prices:
-                valor_total = prices[-1]
-                if valor_unitario is None and quantidade > 0:
-                    if len(prices) == 1:
-                        valor_total = prices[0]
-                        valor_unitario = round(valor_total / quantidade, 2)
-                    elif len(prices) >= 2:
-                        valor_unitario = prices[-2]
-                        valor_total = prices[-1]
+
+            qtd_line = None
+            for t in block_rest:
+                if re.search(r"\bUN\b", t, flags=re.IGNORECASE):
+                    qtd_line = t
+                    break
+
+            if qtd_line:
+                # extrai quantidade
+                qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", qtd_line, flags=re.IGNORECASE)
+                if qtd_match:
+                    try:
+                        quantidade = float(qtd_match.group(1).replace(",", "."))
+                    except ValueError:
+                        quantidade = 1.0
+
+                # preços na linha de quantidade
+                prices_in_qtd_line = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", qtd_line)]
+
+                # se houver "x num"
+                unit_match = re.search(r"[xX]\s*(\d+[.,]\d{2})", qtd_line)
+                if unit_match:
+                    try:
+                        valor_unitario = float(unit_match.group(1).replace(",", "."))
+                    except ValueError:
+                        valor_unitario = None
+
+                # se a linha tiver dois preços tipo "15,89" e "x 8,99", assume primeiro como total
+                if len(prices_in_qtd_line) >= 2:
+                    # a maioria dos cupons tem padrão:
+                    #   TOTAL
+                    #   F
+                    #   1 UN x UNIT
+                    # mas alguns colocam na mesma linha. Ajuste se necessário.
+                    # aqui: se tiver 2 preços, o primeiro vira total, o segundo unit
+                    if valor_unitario is None and len(prices_in_qtd_line) == 2:
+                        valor_total = prices_in_qtd_line[0]
+                        valor_unitario = prices_in_qtd_line[1]
+                    elif valor_unitario is not None and valor_total is None:
+                        # já temos unitário via 'x'; se ainda tiver preço antes dele, usa como total
+                        valor_total = prices_in_qtd_line[0]
+                elif len(prices_in_qtd_line) == 1 and valor_unitario is None:
+                    # só um preço na linha e sem 'x': assume que é total (casos raros)
+                    valor_total = prices_in_qtd_line[0]
+
+            # 3) fallback: se ainda não tiver total, tenta pegar o maior preço do bloco
+            if valor_total is None:
+                # evita pegar o total geral da nota: só olha as linhas do bloco exceto as últimas globais
+                block_text = " ".join(block_rest)
+                prices_block = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", block_text)]
+                if prices_block:
+                    # normalmente o maior preço do bloco será o total do item (quando é KG etc.)
+                    valor_total = max(prices_block)
+
+            # 4) se ainda não tiver unitário e tiver total + quantidade, calcula
+            if valor_unitario is None and valor_total is not None and quantidade > 0:
+                valor_unitario = round(valor_total / quantidade, 2)
 
             itens.append(
                 {
@@ -281,6 +321,7 @@ class OCREngine:
             )
 
         return itens
+
 
     def _clean_desc(self, desc: str) -> str:
         if not desc:
