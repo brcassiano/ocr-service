@@ -157,7 +157,7 @@ class OCREngine:
             return []
 
     # ---------------- STRUCTURE DATA ----------------
-    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
+    def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict]:
         if not ocr_lines:
             return {
                 "tipo_documento": "erro",
@@ -170,7 +170,7 @@ class OCREngine:
         full_text = "\n".join([l.get("text", "") for l in ocr_lines])
         tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
 
-        itens = self._extract_items_by_line(ocr_lines, tipo)
+        itens = self._extract_items_simple(ocr_lines, tipo)
 
         return {
             "tipo_documento": tipo,
@@ -180,84 +180,91 @@ class OCREngine:
             "confianca": 1.0 if itens else 0.0,
         }
 
-    # ---------------- PARSER POR LINHA (NFC-e) ----------------
-    def _extract_items_by_line(self, lines: List[Dict], tipo: str) -> List[Dict]:
+    # ---------------- PARSER SIMPLES POR SEQUÊNCIA ----------------
+    def _extract_items_simple(self, lines: List[Dict], tipo: str) -> List[Dict]:
+        """
+        Parser simples: percorre as linhas em ordem, detecta descrições e,
+        nas próximas linhas, extrai quantidade, unitário e total.
+        """
         data_compra = self._extract_date("\n".join(l.get("text", "") for l in lines))
         itens: List[Dict] = []
 
-        lines_sorted = sorted(
-            [l for l in lines if isinstance(l, dict) and "text" in l],
-            key=lambda x: x.get("y_position", 0),
-        )
+        # remove cabeçalho/rodapé por texto
+        skip_keywords = [
+            "DOCUMENTO AUXILIAR",
+            "SQ.CODIGO",
+            "DESCRICAO",
+            "QTD.",
+            "QTD",
+            "UL.UNIT",
+            "VALOR TOTAL",
+            "QTD. TOTAL",
+            "QTD TOTAL",
+            "CARTAO",
+            "CONSUMIDOR",
+            "HTTPS",
+            "CONSULTE PELA CHAVE",
+        ]
 
-        footer_keywords = ["VALOR TOTAL", "QTD. TOTAL", "CARTAO", "CONSUMIDOR", "HTTPS", "PROTOCOLO"]
-        valid_lines = [
-            l for l in lines_sorted
-            if not any(k in l.get("text", "").upper() for k in footer_keywords)
+        cleaned = [
+            l for l in lines
+            if not any(k in l.get("text", "").upper() for k in skip_keywords)
         ]
 
         i = 0
-        while i < len(valid_lines):
-            text = valid_lines[i].get("text", "").strip().upper()
+        n = len(cleaned)
 
-            # aceita cabeçalho 'NN CODIGO' em qualquer parte da linha
-            header = re.search(r"\b(\d{1,2})\s+(\d{8,14})\b", text)
-            if not header:
+        while i < n:
+            text = cleaned[i]["text"]
+
+            # Linha que parece claramente descrição de produto:
+            # contém letras e não é só número, 'UN', 'X' ou 'F'
+            is_desc = (
+                re.search(r"[A-Za-zÀ-Ü]", text)
+                and not re.match(r"^\d{1,3}\s+\d{8,14}$", text)  # só seq + código
+                and text.upper() not in {"UN", "X", "F", "-"}
+            )
+
+            if not is_desc:
                 i += 1
                 continue
 
-            y_base = valid_lines[i].get("y_position", 0)
-            block = [valid_lines[i]]
-            j = i + 1
-
-            # janela vertical um pouco menor para não misturar itens
-            while j < len(valid_lines) and abs(valid_lines[j].get("y_position", 0) - y_base) <= 25:
-                block.append(valid_lines[j])
-                j += 1
-
-            full_block = " ".join(b.get("text", "") for b in block)
-            block_clean = re.sub(r"\b\d{1,2}\s+\d{8,14}\b", "", full_block).strip()
-
-            # descrição: primeira sequência de letras/números antes da parte numérica
-            desc_match = re.search(
-                r"([A-Z0-9À-Ü][A-Z0-9À-Ü\s\.,/]+?)(?=\s+\d+\s+UN|\s+\d+[.,]\d{2}|$)",
-                block_clean,
-                flags=re.IGNORECASE,
-            )
-            desc_raw = desc_match.group(1) if desc_match else block_clean
+            desc_raw = text
             desc = self._clean_desc(desc_raw)
 
-            prices = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", block_clean)]
-
-            qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", block_clean, flags=re.IGNORECASE)
             quantidade = 1.0
+            valor_unitario = None
+            valor_total = None
+
+            # olha nas próximas poucas linhas (janela pequena)
+            window = cleaned[i + 1 : min(i + 7, n)]
+            window_text = " ".join(w["text"] for w in window)
+
+            # quantidade
+            qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", window_text, flags=re.IGNORECASE)
             if qtd_match:
                 try:
                     quantidade = float(qtd_match.group(1).replace(",", "."))
                 except ValueError:
                     quantidade = 1.0
 
-            valor_unitario = None
-            valor_total = None
+            # valor unitário (depois de 'x')
+            unit_match = re.search(r"[xX]\s*(\d+[.,]\d{2})", window_text, flags=re.IGNORECASE)
+            if unit_match:
+                try:
+                    valor_unitario = float(unit_match.group(1).replace(",", "."))
+                except ValueError:
+                    valor_unitario = None
 
+            # preços possíveis
+            prices = [float(p.replace(",", ".")) for p in re.findall(r"\d+[.,]\d{2}", window_text)]
             if prices:
                 valor_total = prices[-1]
-
-                unit_match = re.search(
-                    r"[xX]\s*(\d+[.,]\d{2})",
-                    block_clean,
-                    flags=re.IGNORECASE,
-                )
-                if unit_match:
-                    try:
-                        valor_unitario = float(unit_match.group(1).replace(",", "."))
-                    except ValueError:
-                        valor_unitario = None
-                else:
-                    if len(prices) == 1 and quantidade > 0:
+                if valor_unitario is None and quantidade > 0:
+                    if len(prices) == 1:
                         valor_total = prices[0]
                         valor_unitario = round(valor_total / quantidade, 2)
-                    elif len(prices) >= 2:
+                    elif len(prices) >= 2 and valor_unitario is None:
                         valor_unitario = prices[-2]
                         valor_total = prices[-1]
 
@@ -272,7 +279,7 @@ class OCREngine:
                 }
             )
 
-            i = j
+            i += 1
 
         return itens
 
