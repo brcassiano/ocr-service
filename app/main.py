@@ -1,20 +1,16 @@
 import logging
 import uvicorn
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from .ocr_engine import OCREngine
 from .models import OCRResponse, QRCodeResponse, HealthResponse
 from . import __version__
 
-
-async def fetch_html_dynamic(self, url: str) -> str:
-    from playwright.async_api import async_playwright
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -34,77 +30,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ocrengine: OCREngine | None = None
-
-# Fallback opcional (não pode quebrar o boot se playwright não existir)
-NfceParserSP = None
-_nfce_parser_instance = None
-try:
-    from .nfce_parser import NfceParserSP as _NfceParserSP
-    NfceParserSP = _NfceParserSP
-    _nfce_parser_instance = NfceParserSP()
-    logger.info("NfceParserSP habilitado (playwright disponível).")
-except Exception as e:
-    logger.warning(f"NfceParserSP desabilitado (playwright ausente/erro import): {e}")
+ocr_engine: OCREngine | None = None
 
 
 @app.on_event("startup")
 async def startup_event():
-    global ocrengine
+    global ocr_engine
     logger.info("Iniciando MEIre OCR Service...")
-    try:
-        ocrengine = OCREngine(use_gpu=False)
-        logger.info("OCR Engine inicializado com sucesso.")
-    except Exception as e:
-        logger.error(f"Erro ao inicializar OCR Engine: {e}", exc_info=True)
-        raise
+    ocr_engine = OCREngine(use_gpu=False)
+    logger.info("OCR Engine inicializado com sucesso")
 
 
+@app.get("/", response_model=HealthResponse)
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(status="healthy", service="meire-ocr-service", version=__version__)
 
 
-@app.post("/api/nfce-from-image", response_model=OCRResponse)
-async def extract_nfce_from_image(
+@app.post("/api/ocr/comprovante", response_model=OCRResponse)
+@app.post("/api/nfce/from-image", response_model=OCRResponse)
+async def extract_comprovante(
     file: UploadFile = File(...),
     debug_ocr: bool = Query(False, description="Se true, inclui ocr_raw_lines na resposta."),
-    qr_fallback: bool = Query(True, description="Se true, tenta fallback via QRCode (se disponível)."),
 ):
     try:
-        if ocrengine is None:
-            raise HTTPException(status_code=500, detail="OCR Engine não inicializado.")
+        if ocr_engine is None:
+            raise HTTPException(status_code=500, detail="OCR Engine não inicializado")
 
         if not file.content_type or not file.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem.")
+            raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem")
 
         image_bytes = await file.read()
         if not image_bytes:
-            raise HTTPException(status_code=400, detail="Arquivo vazio.")
+            raise HTTPException(status_code=400, detail="Arquivo vazio")
 
-        qr_data = ocrengine.extract_qrcode(image_bytes)
-        ocr_lines = ocrengine.extract_text(image_bytes)
-        structured = ocrengine.structure_data(ocr_lines, qr_data)
+        qr_data = ocr_engine.extract_qrcode(image_bytes)
+        ocr_result = ocr_engine.extract_text(image_bytes)
+        structured_data = ocr_engine.structure_data(ocr_result, qr_data)
 
-        structured["ocr_raw_lines"] = ocr_lines if debug_ocr else None
-
-        # fallback via QRCode (somente se parser existir)
-        if (
-            qr_fallback
-            and _nfce_parser_instance is not None
-            and structured.get("qrcode_url")
-            and (not structured.get("itens"))
-        ):
-            try:
-                parsed = await _nfce_parser_instance.parse(structured["qrcode_url"])
-                structured["tipo_documento"] = parsed.get("tipo_documento", structured.get("tipo_documento", "gasto"))
-                structured["itens"] = parsed.get("itens", []) or []
-                structured["mensagem"] = structured["mensagem"] or "Itens obtidos via SEFAZ (fallback QRCode)."
-                structured["confianca"] = 1.0 if structured["itens"] else structured.get("confianca", 0.0)
-            except Exception as e:
-                logger.warning(f"Fallback SEFAZ falhou: {e}", exc_info=True)
-
-        return OCRResponse(**structured)
+        structured_data["ocr_raw_lines"] = ocr_result if debug_ocr else None
+        return OCRResponse(**structured_data)
 
     except HTTPException:
         raise
@@ -123,14 +88,15 @@ async def extract_nfce_from_image(
 @app.post("/api/ocr/qrcode-only", response_model=QRCodeResponse)
 async def extract_qrcode_only(file: UploadFile = File(...)):
     try:
-        if ocrengine is None:
-            raise HTTPException(status_code=500, detail="OCR Engine não inicializado.")
+        if ocr_engine is None:
+            raise HTTPException(status_code=500, detail="OCR Engine não inicializado")
 
         if not file.content_type or not file.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem.")
+            raise HTTPException(status_code=400, detail="Arquivo deve ser imagem")
 
         image_bytes = await file.read()
-        qr_data = ocrengine.extract_qrcode(image_bytes)
+        qr_data = ocr_engine.extract_qrcode(image_bytes)
+
         if not qr_data:
             return QRCodeResponse(found=False, data=None)
 
