@@ -66,9 +66,10 @@ async def extract_comprovante(
 
         qr_data = ocr_engine.extract_qrcode(image_bytes)
         ocr_result = ocr_engine.extract_text(image_bytes)
-        structured_data = ocr_engine.structure_data(ocr_result, qr_data)
 
+        structured_data = ocr_engine.structure_data(ocr_result, qr_data)
         structured_data["ocr_raw_lines"] = ocr_result if debug_ocr else None
+
         return OCRResponse(**structured_data)
 
     except HTTPException:

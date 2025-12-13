@@ -1,13 +1,12 @@
-from paddleocr import PaddleOCR
-from pyzbar.pyzbar import decode
+import logging
+import re
+from datetime import datetime
+from typing import List, Dict, Optional, Any, Tuple
 
 import cv2
 import numpy as np
-import re
-
-from datetime import datetime
-from typing import List, Dict, Optional
-import logging
+from paddleocr import PaddleOCR
+from pyzbar.pyzbar import decode
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +35,13 @@ class OCREngine:
     }
 
     def __init__(self, use_gpu: bool = False):
-        # PaddleOCR 3.x: show_log não existe mais [web:6]
+        # PaddleOCR 3.x: não existe show_log [web:6]
         params = {"use_angle_cls": True, "lang": "pt"}
         if use_gpu:
             params["use_gpu"] = True
         self.ocr = PaddleOCR(**params)
 
+    # ---------------- QR CODE ----------------
     def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
         try:
             nparr = np.frombuffer(image_bytes, np.uint8)
@@ -50,6 +50,7 @@ class OCREngine:
                 return None
 
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
             for processed in [
                 gray,
                 cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
@@ -71,58 +72,133 @@ class OCREngine:
         except Exception:
             return None
 
+    # ---------------- OCR: normalização robusta ----------------
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
+        """
+        Retorna tokens OCR com text/confidence/x_position/y_position.
+        Compatível com variações de output do PaddleOCR (2.x vs 3.x). [web:38]
+        """
         try:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
                 return []
 
+            # tentativa 1 (padrão)
             result = self.ocr.ocr(img)
-            if not result:
-                return []
+            lines = self._normalize_ocr_result_to_lines(result)
 
-            raw = result[0] if isinstance(result, list) and result and isinstance(result[0], list) else result
+            # tentativa 2 (algumas versões precisam cls=True no call)
+            if not lines:
+                result2 = self.ocr.ocr(img, cls=True)
+                lines = self._normalize_ocr_result_to_lines(result2)
 
-            lines: List[Dict] = []
-            for item in raw or []:
-                if not (isinstance(item, list) and len(item) >= 2):
-                    continue
-
-                poly = item[0]
-                rec = item[1]
-                if not (isinstance(rec, (list, tuple)) and len(rec) >= 2):
-                    continue
-
-                text = str(rec[0]).strip()
-                conf = float(rec[1])
-                if not text or conf < 0.4:
-                    continue
-
-                try:
-                    xs = [int(p[0]) for p in poly]
-                    ys = [int(p[1]) for p in poly]
-                    x_pos = min(xs)
-                    y_pos = min(ys)
-                except Exception:
-                    x_pos = None
-                    y_pos = 0
-
-                lines.append(
-                    {
-                        "text": text.replace("×", "X"),
-                        "confidence": round(conf, 3),
-                        "y_position": int(y_pos),
-                        "x_position": int(x_pos) if x_pos is not None else None,
-                    }
-                )
+            # tentativa 3 (fallback: pré-processamento leve)
+            if not lines:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                result3 = self.ocr.ocr(thr, cls=True)
+                lines = self._normalize_ocr_result_to_lines(result3)
 
             lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
             return lines
+
         except Exception as e:
             logger.error(f"extract_text error: {e}", exc_info=True)
             return []
 
+    def _normalize_ocr_result_to_lines(self, result: Any) -> List[Dict]:
+        """
+        Aceita diferentes formatos e extrai lista de:
+        {text, confidence, x_position, y_position}
+        """
+        if result is None:
+            return []
+
+        # Em muitas versões, result é [ [ [poly, (text,score)], ... ] ]
+        if isinstance(result, list) and result:
+            # às vezes vem: [page0] ou já vem direto lista
+            candidates = result[0] if isinstance(result[0], list) else result
+
+            out: List[Dict] = []
+            for item in candidates or []:
+                parsed = self._parse_single_ocr_item(item)
+                if parsed:
+                    out.append(parsed)
+            return out
+
+        return []
+
+    def _parse_single_ocr_item(self, item: Any) -> Optional[Dict]:
+        """
+        Espera algo como:
+          - [poly, (text, score)]
+          - (poly, (text, score))
+          - dict-like (algumas pipelines)
+        """
+        poly = None
+        text = None
+        conf = None
+
+        # formato clássico list/tuple
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            poly = item[0]
+            rec = item[1]
+            if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                text = rec[0]
+                conf = rec[1]
+
+        # formato dict (defensivo)
+        if isinstance(item, dict):
+            poly = item.get("poly") or item.get("points") or item.get("box")
+            text = item.get("text")
+            conf = item.get("score") or item.get("confidence")
+
+        if text is None:
+            return None
+
+        try:
+            text = str(text).strip().replace("×", "X")
+        except Exception:
+            return None
+
+        try:
+            conf = float(conf) if conf is not None else 0.0
+        except Exception:
+            conf = 0.0
+
+        if not text or conf < 0.4:
+            return None
+
+        x_pos, y_pos = self._xy_from_poly(poly)
+
+        return {
+            "text": text,
+            "confidence": round(conf, 3),
+            "y_position": int(y_pos),
+            "x_position": int(x_pos) if x_pos is not None else None,
+        }
+
+    def _xy_from_poly(self, poly: Any) -> Tuple[Optional[int], int]:
+        """
+        poly esperado: [[x,y],...]
+        """
+        try:
+            if poly is None:
+                return None, 0
+            xs = []
+            ys = []
+            for p in poly:
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    xs.append(int(p[0]))
+                    ys.append(int(p[1]))
+            if not xs or not ys:
+                return None, 0
+            return min(xs), min(ys)
+        except Exception:
+            return None, 0
+
+    # ---------------- STRUCTURE DATA ----------------
     def structure_data(self, ocr_lines: List[Dict], qr_data: Optional[List[Dict]]) -> Dict:
         if not ocr_lines:
             return {
