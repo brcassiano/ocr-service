@@ -1,11 +1,14 @@
 import logging
 import uvicorn
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from .ocr_engine import OCREngine
-from .models import OCRResponse, QRCodeResponse, HealthResponse
+from .models import QRCodeResponse, HealthResponse
+from .nfce_parser import NfceParserSP
 from . import __version__
 
 logging.basicConfig(
@@ -37,22 +40,59 @@ ocr_engine: OCREngine | None = None
 async def startup_event():
     global ocr_engine
     logger.info("Iniciando MEIre OCR Service...")
-    ocr_engine = OCREngine(use_gpu=False)
-    logger.info("OCR Engine inicializado com sucesso")
+    try:
+        ocr_engine = OCREngine(use_gpu=False)
+        logger.info("OCR Engine inicializado com sucesso")
+    except Exception as e:
+        logger.error(f"Erro ao inicializar OCR Engine: {e}", exc_info=True)
+        raise
 
 
 @app.get("/", response_model=HealthResponse)
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    return HealthResponse(status="healthy", service="meire-ocr-service", version=__version__)
+    return {"status": "healthy", "service": "meire-ocr-service", "version": __version__}
 
 
-@app.post("/api/ocr/comprovante", response_model=OCRResponse)
-@app.post("/api/nfce/from-image", response_model=OCRResponse)
-async def extract_comprovante(
-    file: UploadFile = File(...),
-    debug_ocr: bool = Query(False, description="Se true, inclui ocr_raw_lines na resposta."),
-):
+class QrCodeBody(BaseModel):
+    qrcode_url: str
+
+
+@app.post("/api/nfce/from-qrcode")
+async def nfce_from_qrcode(body: QrCodeBody):
+    """
+    Recebe um link de QRCode da NFC-e SP e retorna os itens da página (sem OCR).
+    """
+    try:
+        parser = NfceParserSP()
+        data = await parser.parse(body.qrcode_url)
+        # manter compatível com seu payload padrão
+        data["qrcode_url"] = body.qrcode_url
+        data.setdefault("confianca", 1.0 if data.get("itens") else 0.0)
+        return JSONResponse(content=data)
+    except Exception as e:
+        logger.error(f"Erro nfce_from_qrcode: {e}", exc_info=True)
+        return JSONResponse(
+            content={
+                "tipo_documento": "erro",
+                "itens": [],
+                "qrcode_url": body.qrcode_url,
+                "mensagem": f"Erro ao consultar NFC-e via QRCode: {str(e)}",
+                "confianca": 0.0,
+            },
+            status_code=200,
+        )
+
+
+@app.post("/api/ocr/comprovante")
+@app.post("/api/nfce/from-image")
+async def extract_comprovante(file: UploadFile = File(...)):
+    """
+    Fluxo:
+    - Extrai QR do comprovante
+    - Se tiver QRCode SP, tenta consultar página e retornar itens (sem OCR)
+    - Se não der, cai pro OCR normal
+    """
     try:
         if ocr_engine is None:
             raise HTTPException(status_code=500, detail="OCR Engine não inicializado")
@@ -65,24 +105,41 @@ async def extract_comprovante(
             raise HTTPException(status_code=400, detail="Arquivo vazio")
 
         qr_data = ocr_engine.extract_qrcode(image_bytes)
+
+        # 1) tenta via QRCode -> SEFAZ (sem OCR)
+        if qr_data and isinstance(qr_data, list) and qr_data[0].get("data"):
+            qrcode_url = qr_data[0]["data"]
+            if "nfce.fazenda.sp.gov.br" in qrcode_url:
+                try:
+                    parser = NfceParserSP()
+                    data = await parser.parse(qrcode_url)
+                    data["qrcode_url"] = qrcode_url
+                    data.setdefault("confianca", 1.0 if data.get("itens") else 0.0)
+                    return JSONResponse(content=data)
+                except Exception as e:
+                    logger.warning(f"Falha consulta SEFAZ via QR, caindo pro OCR: {e}")
+
+        # 2) fallback OCR (se não tinha QR ou se consulta falhou)
         ocr_result = ocr_engine.extract_text(image_bytes)
-
         structured_data = ocr_engine.structure_data(ocr_result, qr_data)
-        structured_data["ocr_raw_lines"] = ocr_result if debug_ocr else None
 
-        return OCRResponse(**structured_data)
+        # TEMPORÁRIO: devolver linhas brutas de OCR para debug
+        structured_data["ocr_raw_lines"] = ocr_result
+        return JSONResponse(content=structured_data)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro interno: {e}", exc_info=True)
-        return OCRResponse(
-            tipo_documento="erro",
-            itens=[],
-            qrcode_url=None,
-            mensagem=f"Erro interno: {str(e)}",
-            confianca=0.0,
-            ocr_raw_lines=None,
+        logger.error(f"Erro interno extract_comprovante: {e}", exc_info=True)
+        return JSONResponse(
+            content={
+                "tipo_documento": "erro",
+                "itens": [],
+                "qrcode_url": None,
+                "mensagem": f"Erro interno: {str(e)}",
+                "confianca": 0.0,
+            },
+            status_code=200,
         )
 
 
@@ -99,9 +156,8 @@ async def extract_qrcode_only(file: UploadFile = File(...)):
         qr_data = ocr_engine.extract_qrcode(image_bytes)
 
         if not qr_data:
-            return QRCodeResponse(found=False, data=None)
-
-        return QRCodeResponse(found=True, data=qr_data[0])
+            return {"found": False, "data": None}
+        return {"found": True, "data": qr_data[0]}
 
     except HTTPException:
         raise
