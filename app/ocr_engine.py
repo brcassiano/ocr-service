@@ -35,7 +35,7 @@ class OCREngine:
     }
 
     def __init__(self, use_gpu: bool = False):
-        # PaddleOCR 3.x: use_angle_cls na init, não no call
+        # PaddleOCR 3.x: show_log não existe; use_angle_cls é na init
         params = {"use_angle_cls": True, "lang": "pt"}
         if use_gpu:
             params["use_gpu"] = True
@@ -72,70 +72,69 @@ class OCREngine:
         except Exception:
             return None
 
-    # ---------------- OCR: tentativas progressivas ----------------
+    # ---------------- OCR (robusto em 3.x) ----------------
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
         """
-        Retorna tokens OCR com text/confidence/x_position/y_position.
-        Compatível com PaddleOCR 3.x (sem cls=True no call). [web:38]
+        Retorna tokens OCR: text/confidence/x_position/y_position.
+        Importante: PaddleOCR 3.x (pipeline PaddleX) pode exigir imagem 3 canais (H,W,3). [conversation_history:query]
         """
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        base = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if base is None:
+            logger.warning("cv2.imdecode retornou None")
+            return []
+
+        attempts: List[Tuple[str, np.ndarray]] = []
+
+        # tentativa 1: original (BGR)
+        attempts.append(("raw_bgr", base))
+
+        # tentativa 2: grayscale -> threshold -> volta para BGR (3 canais)
         try:
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                logger.warning("cv2.imdecode retornou None")
-                return []
-
-            # tentativa 1: imagem original
-            result = self.ocr.ocr(img)
-            lines = self._normalize_ocr_result_to_lines(result)
-            if lines:
-                logger.info(f"OCR sucesso (raw): {len(lines)} linhas")
-                lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
-                return lines
-
-            # tentativa 2: pré-processamento básico (binarização)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            result2 = self.ocr.ocr(thr)
-            lines = self._normalize_ocr_result_to_lines(result2)
-            if lines:
-                logger.info(f"OCR sucesso (thresh): {len(lines)} linhas")
-                lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
-                return lines
-
-            # tentativa 3: redimensionar (para imagens muito pequenas)
-            h, w = img.shape[:2]
-            if h < 600 or w < 400:
-                scale = max(800 / w, 1200 / h)
-                resized = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                result3 = self.ocr.ocr(resized)
-                lines = self._normalize_ocr_result_to_lines(result3)
-                if lines:
-                    logger.info(f"OCR sucesso (resize): {len(lines)} linhas")
-                    lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
-                    return lines
-
-            logger.warning("Nenhuma linha OCR encontrada após 3 tentativas")
-            return []
-
+            gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+            thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            thr_bgr = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
+            attempts.append(("thresh_bgr", thr_bgr))
         except Exception as e:
-            logger.error(f"extract_text error: {e}", exc_info=True)
-            return []
+            logger.warning(f"Falha preparando thresh: {e}")
+
+        # tentativa 3: zoom (BGR)
+        try:
+            zoom = cv2.resize(base, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            attempts.append(("zoom_bgr", zoom))
+        except Exception as e:
+            logger.warning(f"Falha preparando zoom: {e}")
+
+        # executar tentativas (cada uma protegida, não derruba o fluxo)
+        for name, img in attempts:
+            try:
+                result = self.ocr.ocr(img)
+                lines = self._normalize_ocr_result_to_lines(result)
+                if lines:
+                    lines.sort(
+                        key=lambda x: (
+                            x["y_position"],
+                            x["x_position"] if x["x_position"] is not None else 10**9,
+                        )
+                    )
+                    logger.info(f"OCR sucesso ({name}): {len(lines)} tokens")
+                    return lines
+                else:
+                    logger.info(f"OCR vazio ({name})")
+            except Exception as e:
+                logger.error(f"OCR erro ({name}): {e}", exc_info=True)
+                continue
+
+        logger.warning("Nenhuma linha OCR encontrada após todas as tentativas")
+        return []
 
     def _normalize_ocr_result_to_lines(self, result: Any) -> List[Dict]:
-        """
-        Aceita diferentes formatos e extrai lista de:
-        {text, confidence, x_position, y_position}
-        """
         if result is None:
             return []
 
-        # Em PaddleOCR 3.x, formato comum: [ [ [poly, (text,score)], ... ] ]
-        # ou: [ [item, item, ...] ]
+        # formato comum: [ [ [poly,(text,score)], ... ] ]
         if isinstance(result, list) and result:
-            # às vezes vem: [page0] ou já vem direto lista
             candidates = result[0] if isinstance(result[0], list) else result
-
             out: List[Dict] = []
             for item in candidates or []:
                 parsed = self._parse_single_ocr_item(item)
@@ -146,17 +145,10 @@ class OCREngine:
         return []
 
     def _parse_single_ocr_item(self, item: Any) -> Optional[Dict]:
-        """
-        Espera algo como:
-          - [poly, (text, score)]
-          - (poly, (text, score))
-          - dict-like (algumas pipelines)
-        """
         poly = None
         text = None
         conf = None
 
-        # formato clássico list/tuple
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             poly = item[0]
             rec = item[1]
@@ -164,7 +156,6 @@ class OCREngine:
                 text = rec[0]
                 conf = rec[1]
 
-        # formato dict (defensivo)
         if isinstance(item, dict):
             poly = item.get("poly") or item.get("points") or item.get("box")
             text = item.get("text")
@@ -196,9 +187,6 @@ class OCREngine:
         }
 
     def _xy_from_poly(self, poly: Any) -> Tuple[Optional[int], int]:
-        """
-        poly esperado: [[x,y],...]
-        """
         try:
             if poly is None:
                 return None, 0
