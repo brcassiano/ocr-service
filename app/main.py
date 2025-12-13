@@ -1,11 +1,11 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 import logging
+import uvicorn
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .ocr_engine import OCREngine
 from .models import OCRResponse, QRCodeResponse, HealthResponse
-from . import version
 from . import __version__
 
 
