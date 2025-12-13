@@ -6,6 +6,8 @@ import logging
 from .ocr_engine import OCREngine
 from .models import OCRResponse, QRCodeResponse, HealthResponse
 from . import version
+from . import __version__
+
 
 async def fetch_html_dynamic(self, url: str) -> str:
     from playwright.async_api import async_playwright
@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="MEIre OCR Service",
     description="Serviço de OCR especializado em comprovantes fiscais brasileiros",
-    version=version,
+    version=__version__,
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -60,7 +62,7 @@ async def startup_event():
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    return HealthResponse(status="healthy", service="meire-ocr-service", version=version)
+    return HealthResponse(status="healthy", service="meire-ocr-service", version=__version__)
 
 
 @app.post("/api/nfce-from-image", response_model=OCRResponse)
