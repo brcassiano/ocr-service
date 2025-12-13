@@ -5,8 +5,10 @@ import logging
 
 from .ocr_engine import OCREngine
 from .models import OCRResponse, QRCodeResponse, HealthResponse
-from .nfce_parser import NfceParserSP
 from . import version
+
+async def fetch_html_dynamic(self, url: str) -> str:
+    from playwright.async_api import async_playwright
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +33,17 @@ app.add_middleware(
 )
 
 ocrengine: OCREngine | None = None
-nfce_parser = NfceParserSP()
+
+# Fallback opcional (não pode quebrar o boot se playwright não existir)
+NfceParserSP = None
+_nfce_parser_instance = None
+try:
+    from .nfce_parser import NfceParserSP as _NfceParserSP
+    NfceParserSP = _NfceParserSP
+    _nfce_parser_instance = NfceParserSP()
+    logger.info("NfceParserSP habilitado (playwright disponível).")
+except Exception as e:
+    logger.warning(f"NfceParserSP desabilitado (playwright ausente/erro import): {e}")
 
 
 @app.on_event("startup")
@@ -55,7 +67,7 @@ async def health_check():
 async def extract_nfce_from_image(
     file: UploadFile = File(...),
     debug_ocr: bool = Query(False, description="Se true, inclui ocr_raw_lines na resposta."),
-    qr_fallback: bool = Query(True, description="Se true, tenta fallback via QRCode (SEFAZ) quando OCR falhar."),
+    qr_fallback: bool = Query(True, description="Se true, tenta fallback via QRCode (se disponível)."),
 ):
     try:
         if ocrengine is None:
@@ -72,23 +84,22 @@ async def extract_nfce_from_image(
         ocr_lines = ocrengine.extract_text(image_bytes)
         structured = ocrengine.structure_data(ocr_lines, qr_data)
 
-        # debug opcional (sem quebrar schema)
-        if debug_ocr:
-            structured["ocr_raw_lines"] = ocr_lines
-        else:
-            structured["ocr_raw_lines"] = None
+        structured["ocr_raw_lines"] = ocr_lines if debug_ocr else None
 
-        # fallback via QRCode (SEFAZ-SP) se OCR vier vazio ou muito fraco
-        if qr_fallback and structured.get("qrcode_url") and (not structured.get("itens")):
+        # fallback via QRCode (somente se parser existir)
+        if (
+            qr_fallback
+            and _nfce_parser_instance is not None
+            and structured.get("qrcode_url")
+            and (not structured.get("itens"))
+        ):
             try:
-                parsed = await nfce_parser.parse(structured["qrcode_url"])
-                # mantém o formato do OCRResponse
+                parsed = await _nfce_parser_instance.parse(structured["qrcode_url"])
                 structured["tipo_documento"] = parsed.get("tipo_documento", structured.get("tipo_documento", "gasto"))
                 structured["itens"] = parsed.get("itens", []) or []
                 structured["mensagem"] = structured["mensagem"] or "Itens obtidos via SEFAZ (fallback QRCode)."
                 structured["confianca"] = 1.0 if structured["itens"] else structured.get("confianca", 0.0)
             except Exception as e:
-                # fallback falhou: mantém OCR e registra
                 logger.warning(f"Fallback SEFAZ falhou: {e}", exc_info=True)
 
         return OCRResponse(**structured)
@@ -97,7 +108,6 @@ async def extract_nfce_from_image(
         raise
     except Exception as e:
         logger.error(f"Erro interno: {e}", exc_info=True)
-        # mantém contrato
         return OCRResponse(
             tipo_documento="erro",
             itens=[],
