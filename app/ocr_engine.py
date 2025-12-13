@@ -35,7 +35,7 @@ class OCREngine:
     }
 
     def __init__(self, use_gpu: bool = False):
-        # PaddleOCR 3.x: não existe show_log [web:6]
+        # PaddleOCR 3.x: use_angle_cls na init, não no call
         params = {"use_angle_cls": True, "lang": "pt"}
         if use_gpu:
             params["use_gpu"] = True
@@ -72,36 +72,51 @@ class OCREngine:
         except Exception:
             return None
 
-    # ---------------- OCR: normalização robusta ----------------
+    # ---------------- OCR: tentativas progressivas ----------------
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
         """
         Retorna tokens OCR com text/confidence/x_position/y_position.
-        Compatível com variações de output do PaddleOCR (2.x vs 3.x). [web:38]
+        Compatível com PaddleOCR 3.x (sem cls=True no call). [web:38]
         """
         try:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
+                logger.warning("cv2.imdecode retornou None")
                 return []
 
-            # tentativa 1 (padrão)
+            # tentativa 1: imagem original
             result = self.ocr.ocr(img)
             lines = self._normalize_ocr_result_to_lines(result)
+            if lines:
+                logger.info(f"OCR sucesso (raw): {len(lines)} linhas")
+                lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
+                return lines
 
-            # tentativa 2 (algumas versões precisam cls=True no call)
-            if not lines:
-                result2 = self.ocr.ocr(img, cls=True)
-                lines = self._normalize_ocr_result_to_lines(result2)
+            # tentativa 2: pré-processamento básico (binarização)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            result2 = self.ocr.ocr(thr)
+            lines = self._normalize_ocr_result_to_lines(result2)
+            if lines:
+                logger.info(f"OCR sucesso (thresh): {len(lines)} linhas")
+                lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
+                return lines
 
-            # tentativa 3 (fallback: pré-processamento leve)
-            if not lines:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-                result3 = self.ocr.ocr(thr, cls=True)
+            # tentativa 3: redimensionar (para imagens muito pequenas)
+            h, w = img.shape[:2]
+            if h < 600 or w < 400:
+                scale = max(800 / w, 1200 / h)
+                resized = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                result3 = self.ocr.ocr(resized)
                 lines = self._normalize_ocr_result_to_lines(result3)
+                if lines:
+                    logger.info(f"OCR sucesso (resize): {len(lines)} linhas")
+                    lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
+                    return lines
 
-            lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
-            return lines
+            logger.warning("Nenhuma linha OCR encontrada após 3 tentativas")
+            return []
 
         except Exception as e:
             logger.error(f"extract_text error: {e}", exc_info=True)
@@ -115,7 +130,8 @@ class OCREngine:
         if result is None:
             return []
 
-        # Em muitas versões, result é [ [ [poly, (text,score)], ... ] ]
+        # Em PaddleOCR 3.x, formato comum: [ [ [poly, (text,score)], ... ] ]
+        # ou: [ [item, item, ...] ]
         if isinstance(result, list) and result:
             # às vezes vem: [page0] ou já vem direto lista
             candidates = result[0] if isinstance(result[0], list) else result
@@ -370,7 +386,7 @@ class OCREngine:
             return "ITEM DESCONHECIDO"
         desc = desc.upper()
         desc = re.sub(r"\s+", " ", desc).strip()
-        desc = re.sub(r"[^A-Z0-9À-Ü\\s\\.,/-]", "", desc)
+        desc = re.sub(r"[^A-Z0-9À-Ü\s.,/-]", "", desc)
         for wrong, right in self.COMMON_CORRECTIONS.items():
             desc = desc.replace(wrong, right)
         desc = desc.strip(" -")
