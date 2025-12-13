@@ -6,7 +6,7 @@ import numpy as np
 import re
 
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import logging
 
@@ -21,19 +21,13 @@ class OCREngine:
     COMMON_CORRECTIONS = {
         "ALHOTRADIC": "ALHO TRADIC",
         "QJ": "QUEIJO",
+        "ZER0": "ZERO",
+        "I0G": "IOG",
+        "OUOS": "OVOS",
+        "PA0": "PAO",
+        "P.QUEI.JO": "P.QUEIJO",
     }
 
-    # Marcadores para cortar a área de itens (no seu cupom tem esses termos) [file:comp4.jpg]
-    ITEMS_HEADER_HINTS = [
-        "SQ.CODIGO",
-        "SQ. CODIGO",
-        "DESCRICAO",
-        "DESCRIÇÃO",
-        "QTD",
-        "VL.UNIT",
-        "VL. UNIT",
-        "TOTAL",
-    ]
     STOP_HINTS = [
         "QTD. TOTAL DE ITENS",
         "QTD TOTAL DE ITENS",
@@ -42,16 +36,14 @@ class OCREngine:
         "CARTÃO",
         "CONSUMIDOR",
         "CONSULTE PELA CHAVE",
+        "CHAVE DE ACESSO",
+        "PROTOCOLO",
     ]
 
     def __init__(self, use_gpu: bool = False):
         self.debug_log: List[str] = []
         try:
-            params = {
-                "use_angle_cls": True,   # melhora em fotos tortas de cupom [file:comp4.jpg]
-                "lang": "pt",
-                "show_log": False,
-            }
+            params = {"use_angle_cls": True, "lang": "pt", "show_log": False}
             if use_gpu:
                 params["use_gpu"] = True
             self.ocr = PaddleOCR(**params)
@@ -86,12 +78,7 @@ class OCREngine:
                 if decoded:
                     for obj in decoded:
                         if obj.type == "QRCODE":
-                            return [
-                                {
-                                    "data": obj.data.decode("utf-8", errors="ignore"),
-                                    "type": obj.type,
-                                }
-                            ]
+                            return [{"data": obj.data.decode("utf-8", errors="ignore"), "type": obj.type}]
 
             detector = cv2.QRCodeDetector()
             data, _, _ = detector.detectAndDecode(img)
@@ -140,11 +127,8 @@ class OCREngine:
                         poly = rec_polys[i]
                         if hasattr(poly, "tolist"):
                             poly = poly.tolist()
-                        if len(poly) > 0:
-                            if isinstance(poly[0], (list, tuple)):
-                                y_pos = int(poly[0][1])
-                            elif len(poly) >= 2:
-                                y_pos = int(poly[1])
+                        if poly and isinstance(poly[0], (list, tuple)):
+                            y_pos = int(poly[0][1])
 
                     if text and float(confidence) > 0.4:
                         lines.append(
@@ -179,12 +163,11 @@ class OCREngine:
                         lines.append(
                             {
                                 "text": str(text).strip(),
-                                "confidence": round(confidence, 3),
+                                "confidence": round(float(confidence), 3),
                                 "y_position": y_pos,
                             }
                         )
 
-            # ordena por posição vertical
             lines.sort(key=lambda x: x["y_position"])
             return lines
 
@@ -206,10 +189,14 @@ class OCREngine:
         full_text = "\n".join([l.get("text", "") for l in ocr_lines])
         tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
 
-        # recorta para área provável de itens e remove rodapé [file:comp4.jpg]
-        item_lines = self._slice_item_area(ocr_lines)
+        # 1) recorta área de itens (após o header e antes do rodapé)
+        item_tokens = self._slice_item_area(ocr_lines)
 
-        itens = self._extract_items_by_line_regex(item_lines, tipo)
+        # 2) reconstrói "linhas" juntando tokens por y
+        reconstructed = self._reconstruct_lines_by_y(item_tokens, y_tol=10)
+
+        # 3) extrai itens (agora sim, com linhas completas)
+        itens = self._extract_items_from_reconstructed_lines(reconstructed, tipo)
 
         return {
             "tipo_documento": tipo,
@@ -221,111 +208,134 @@ class OCREngine:
 
     # ---------------- SLICE: ÁREA DE ITENS ----------------
     def _slice_item_area(self, ocr_lines: List[Dict]) -> List[Dict]:
-        texts = [l.get("text", "") for l in ocr_lines]
-        upper = [t.upper().strip() for t in texts]
-
-        # encontra uma linha que pareça cabeçalho da tabela (contém DESCRICAO e QTD etc.) [file:comp4.jpg]
+        # acha o cabeçalho: no seu raw aparece SQ.CODIGO / DESCRICAO / QTD / VL.UNIT / ST / TOTAL [conversation_history:query]
         start_idx = 0
-        for i, t in enumerate(upper):
-            if ("DESCR" in t) and ("QTD" in t or "QT" in t) and ("TOTAL" in t or "VL" in t):
+        for i, l in enumerate(ocr_lines):
+            t = (l.get("text") or "").upper()
+            if "SQ.CODIGO" in t or "SQ. CODIGO" in t:
                 start_idx = i + 1
                 break
 
-        # encontra rodapé por hints [file:comp4.jpg]
-        end_idx = len(texts)
-        for i in range(start_idx, len(upper)):
-            if any(h in upper[i] for h in self.STOP_HINTS):
+        # corta no rodapé [conversation_history:query]
+        end_idx = len(ocr_lines)
+        for i in range(start_idx, len(ocr_lines)):
+            t = (ocr_lines[i].get("text") or "").upper()
+            if any(h in t for h in self.STOP_HINTS):
                 end_idx = i
                 break
 
-        sliced = ocr_lines[start_idx:end_idx]
+        return ocr_lines[start_idx:end_idx]
 
-        # fallback extra: se ainda vier muita coisa, corta ao ver "QTD. TOTAL DE ITENS" etc.
-        cleaned: List[Dict] = []
-        for l in sliced:
-            t = (l.get("text", "") or "").upper()
-            if "QTD. TOTAL DE ITENS" in t or "VALOR TOTAL" in t:
-                break
-            cleaned.append(l)
-
-        return cleaned
-
-    # ---------------- PARSER: POR LINHA (REGEX) ----------------
-    def _extract_items_by_line_regex(self, lines: List[Dict], tipo: str) -> List[Dict]:
+    # ---------------- RECONSTRUIR LINHAS POR Y ----------------
+    def _reconstruct_lines_by_y(self, tokens: List[Dict], y_tol: int = 10) -> List[str]:
         """
-        Para cupons como o anexado, cada item geralmente cabe em uma única linha: [file:comp4.jpg]
-          NN CODIGO DESCRICAO ... QTD UN X VL_UNIT ST TOTAL
-
-        Estratégia:
-        - Filtrar linhas que começam com NN + código (8-14 dígitos).
-        - Extrair:
-          - descrição (lazy) até achar a quantidade+unidade
-          - quantidade + unidade (UN/KG/LT/...)
-          - unitário após X (opcional)
-          - total = último preço na linha
-        - Se unitário não existir, calcula total/qtd.
+        PaddleOCR frequentemente devolve cada coluna como um token separado; aqui juntamos por proximidade de y. [conversation_history:query]
         """
-        data_compra = self._extract_date("\n".join((l.get("text", "") or "") for l in lines))
+        # normaliza
+        cleaned = []
+        for t in tokens:
+            txt = (t.get("text") or "").strip()
+            if not txt:
+                continue
+            cleaned.append(
+                {
+                    "text": txt.replace("×", "X"),
+                    "y": int(t.get("y_position") or 0),
+                }
+            )
 
-        # Normaliza pequenos ruídos comuns de OCR
-        def norm(s: str) -> str:
-            s = s.replace("×", "X")
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
+        # agrupa em bandas
+        groups: List[Tuple[int, List[str]]] = []  # (y_ref, [texts])
+        for tok in cleaned:
+            placed = False
+            for gi in range(len(groups)):
+                y_ref, arr = groups[gi]
+                if abs(tok["y"] - y_ref) <= y_tol:
+                    arr.append(tok["text"])
+                    # ajusta y_ref para média simples (estabiliza)
+                    new_y = int((y_ref + tok["y"]) / 2)
+                    groups[gi] = (new_y, arr)
+                    placed = True
+                    break
+            if not placed:
+                groups.append((tok["y"], [tok["text"]]))
+
+        # ordena por y e junta textos na ordem em que chegaram (boa o suficiente pro seu output)
+        groups.sort(key=lambda x: x[0])
+
+        lines = []
+        for _, parts in groups:
+            line = " ".join(parts)
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                lines.append(line)
+        return lines
+
+    # ---------------- EXTRATOR DE ITENS (COM MERGE DE LINHAS QUEBRADAS) ----------------
+    def _extract_items_from_reconstructed_lines(self, lines: List[str], tipo: str) -> List[Dict]:
+        data_compra = self._extract_date("\n".join(lines))
+
+        header_pat = re.compile(r"^\s*(\d{1,2})\s+(\d{8,14})\b")
+        money_pat = re.compile(r"\d+[.,]\d{2}")
+
+        # captura qty/un, unit e total ao final (último dinheiro da linha)
+        qty_pat = re.compile(r"(?P<qtd>\d+[.,]?\d*)\s*(?P<un>UN|KG|LT|L|PC|PCT|CX|FD)\b", re.IGNORECASE)
+        unit_pat = re.compile(r"\b[Xx]\s*(?P<unit>\d+[.,]\d{2})")
 
         itens: List[Dict] = []
 
-        # Ex.: "01 07891515546335 BATATA SADIA 1,05KG 1 UN X 15,89 T03 15,89" [file:comp4.jpg]
-        line_pattern = re.compile(
-            r"^\s*(?P<nn>\d{1,2})\s+(?P<code>\d{8,14})\s+"
-            r"(?P<body>.+?)\s*$"
-        )
+        i = 0
+        while i < len(lines):
+            line = self._norm(lines[i])
 
-        # Dentro do body, localizar o trecho de quantidade/unidade e unitário opcional:
-        # aceita "1 UN X 15,89" ou "0,546 KG X 26,90" etc. [file:comp4.jpg]
-        qtd_pattern = re.compile(
-            r"(?P<desc>.+?)\s+"
-            r"(?P<qtd>\d+[.,]?\d*)\s*(?P<un>UN|KG|LT|L|PC|PCT|CX|FD)\b"
-            r"(?:\s*[xX]\s*(?P<unit>\d+[.,]\d{2}))?",
-            flags=re.IGNORECASE
-        )
-
-        money_pattern = re.compile(r"\d+[.,]\d{2}")
-
-        for l in lines:
-            raw = l.get("text", "") or ""
-            raw = norm(raw)
-            if not raw:
+            # só começa item se tiver NN + código
+            if not header_pat.search(line):
+                i += 1
                 continue
 
-            m = line_pattern.match(raw)
-            if not m:
-                continue
+            # merge: junta próximas linhas até encontrar UN/KG e pelo menos 1 valor monetário
+            merged = line
+            j = i + 1
+            while j < len(lines):
+                if header_pat.search(self._norm(lines[j])):  # próximo item começou
+                    break
 
-            body = m.group("body")
+                merged_try = self._norm(merged + " " + lines[j])
+                # critério: se já temos quantidade+un e algum dinheiro, pode parar
+                if qty_pat.search(merged_try) and money_pat.search(merged_try):
+                    merged = merged_try
+                    j += 1
+                    break
 
-            # total = último dinheiro na linha (mais estável pro layout do cupom) [file:comp4.jpg]
-            monies = money_pattern.findall(raw)
+                merged = merged_try
+                j += 1
+
+            # agora parseia merged
+            # remove "NN codigo" do começo para sobrar corpo
+            body = header_pat.sub("", merged).strip()
+
+            # total = último dinheiro encontrado
+            monies = money_pat.findall(merged)
             if not monies:
+                i = j
                 continue
             valor_total = self._to_float(monies[-1])
 
-            qm = qtd_pattern.search(body)
+            qm = qty_pat.search(body)
             if not qm:
-                # se OCR quebrou e não achou qtd, ignora (melhor do que inventar)
+                i = j
                 continue
 
-            desc_raw = qm.group("desc")
             quantidade = self._to_float(qm.group("qtd")) or 1.0
 
-            unit_raw = qm.group("unit")
-            valor_unitario = self._to_float(unit_raw) if unit_raw else None
-
-            desc = self._clean_desc(desc_raw)
-
-            # se unitário não veio, calcula por total/qtd
+            um = unit_pat.search(body)
+            valor_unitario = self._to_float(um.group("unit")) if um else None
             if valor_unitario is None and valor_total is not None and quantidade > 0:
                 valor_unitario = round(valor_total / quantidade, 2)
+
+            # descrição: tudo antes do match de quantidade/un
+            desc_raw = body[: qm.start()].strip()
+            desc = self._clean_desc(desc_raw)
 
             itens.append(
                 {
@@ -338,46 +348,49 @@ class OCREngine:
                 }
             )
 
+            i = j
+
         return itens
 
     # ---------------- HELPERS ----------------
+    def _norm(self, s: str) -> str:
+        s = (s or "").replace("×", "X")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
     def _to_float(self, s: Optional[str]) -> Optional[float]:
         if not s:
             return None
+        s = s.strip()
         try:
-            return float(s.replace(".", "").replace(",", ".") if s.count(",") == 1 and s.count(".") > 1 else s.replace(",", "."))
+            # padrão BR: 1.234,56 / 123,45 / 10.39 (OCR às vezes troca)
+            s = s.replace(" ", "")
+            if s.count(",") == 1 and s.count(".") >= 1:
+                # assume pontos como milhar
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", ".")
+            return float(s)
         except Exception:
-            try:
-                return float(s.replace(",", "."))
-            except Exception:
-                return None
+            return None
 
     def _clean_desc(self, desc: str) -> str:
         if not desc:
             return "ITEM DESCONHECIDO"
 
-        # remove lixo inicial (se algum dia entrar NN etc.)
-        desc = re.sub(r"^\d+\s*", "", desc)
-
-        # remove sufixos de unidade soltos
-        desc = re.sub(r"\s+(UN|KG|LT|PC|L|M)\s*$", "", desc, flags=re.IGNORECASE)
-
-        # normaliza espaços e upper
-        desc = re.sub(r"\s+", " ", desc).strip().upper()
-
-        # remove caracteres estranhos
-        desc = re.sub(r"[^A-Z0-9À-Ü\s\-.,/]", "", desc)
-
-        if desc in {"UN", "X", "F", "-", ""}:
-            return "ITEM DESCONHECIDO"
+        desc = desc.upper()
+        desc = re.sub(r"\s+", " ", desc).strip()
+        desc = re.sub(r"[^A-Z0-9À-Ü\s\\-.,/]", "", desc)
 
         for wrong, right in self.COMMON_CORRECTIONS.items():
             if wrong in desc:
                 desc = desc.replace(wrong, right)
 
-        return desc if desc else "ITEM DESCONHECIDO"
+        if desc in {"UN", "X", "F", "-", ""}:
+            return "ITEM DESCONHECIDO"
 
-    # ---------------- DATA ----------------
+        return desc
+
     def _extract_date(self, text: str) -> str:
         patterns = [
             r"emiss[aã]o[:\s]*(\d{2}/\d{2}/\d{4})",
