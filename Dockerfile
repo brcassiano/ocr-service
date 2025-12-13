@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # 3. Pré-baixar modelos PaddleOCR (Cache no build)
 # Isso evita download na hora do startup
-RUN python -c "from paddleocr import PaddleOCR; ocr = PaddleOCR(use_angle_cls=False, lang='pt', show_log=False); print('✓ Modelos baixados')" || echo "Falha no download"
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='pt', show_log=False); print('✓ Modelos baixados')" || echo "Falha no download"
 
 # 4. Copiar código da aplicação
 COPY ./app ./app

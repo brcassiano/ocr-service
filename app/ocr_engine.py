@@ -1,7 +1,7 @@
 import logging
 import re
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional
 
 import cv2
 import numpy as np
@@ -35,17 +35,21 @@ class OCREngine:
     }
 
     def __init__(self, use_gpu: bool = False):
-        # PaddleOCR 3.x: show_log não existe; use_angle_cls é na init
-        params = {"use_angle_cls": True, "lang": "pt"}
+        # PaddleOCR 2.7.x: use_angle_cls na init e cls no call são suportados. [web:87][web:12]
+        params = {
+            "use_angle_cls": True,
+            "lang": "pt",
+            "show_log": False,
+        }
         if use_gpu:
             params["use_gpu"] = True
+
         self.ocr = PaddleOCR(**params)
 
     # ---------------- QR CODE ----------------
     def extract_qrcode(self, image_bytes: bytes) -> Optional[List[Dict]]:
         try:
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            img = self._decode_image_bgr(image_bytes)
             if img is None:
                 return None
 
@@ -72,130 +76,88 @@ class OCREngine:
         except Exception:
             return None
 
-    # ---------------- OCR (robusto em 3.x) ----------------
+    # ---------------- OCR ----------------
     def extract_text(self, image_bytes: bytes) -> List[Dict]:
         """
-        Retorna tokens OCR: text/confidence/x_position/y_position.
-        Importante: PaddleOCR 3.x (pipeline PaddleX) pode exigir imagem 3 canais (H,W,3). [conversation_history:query]
+        Retorna linhas OCR no formato interno:
+        [{text, confidence, y_position, x_position}, ...]
+        Compatível com PaddleOCR 2.7.3. [web:87]
         """
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        base = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if base is None:
-            logger.warning("cv2.imdecode retornou None")
+        img = self._decode_image_bgr(image_bytes)
+        if img is None:
+            logger.warning("Imagem inválida (decode retornou None)")
             return []
 
-        attempts: List[Tuple[str, np.ndarray]] = []
+        # Tentativas: original -> threshold -> zoom
+        attempts = [
+            ("raw", img),
+            ("thresh", self._to_bgr(self._threshold(img))),
+            ("zoom", cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)),
+        ]
 
-        # tentativa 1: original (BGR)
-        attempts.append(("raw_bgr", base))
-
-        # tentativa 2: grayscale -> threshold -> volta para BGR (3 canais)
-        try:
-            gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
-            thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-            thr_bgr = cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)
-            attempts.append(("thresh_bgr", thr_bgr))
-        except Exception as e:
-            logger.warning(f"Falha preparando thresh: {e}")
-
-        # tentativa 3: zoom (BGR)
-        try:
-            zoom = cv2.resize(base, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-            attempts.append(("zoom_bgr", zoom))
-        except Exception as e:
-            logger.warning(f"Falha preparando zoom: {e}")
-
-        # executar tentativas (cada uma protegida, não derruba o fluxo)
-        for name, img in attempts:
+        for name, attempt_img in attempts:
             try:
-                result = self.ocr.ocr(img)
-                lines = self._normalize_ocr_result_to_lines(result)
+                result = self.ocr.ocr(attempt_img, cls=True)  # PaddleOCR 2.x [web:87]
+                lines = self._normalize_paddle2_result(result)
                 if lines:
-                    lines.sort(
-                        key=lambda x: (
-                            x["y_position"],
-                            x["x_position"] if x["x_position"] is not None else 10**9,
-                        )
-                    )
+                    lines.sort(key=lambda x: (x["y_position"], x["x_position"] if x["x_position"] is not None else 10**9))
                     logger.info(f"OCR sucesso ({name}): {len(lines)} tokens")
                     return lines
-                else:
-                    logger.info(f"OCR vazio ({name})")
+                logger.info(f"OCR vazio ({name})")
             except Exception as e:
                 logger.error(f"OCR erro ({name}): {e}", exc_info=True)
-                continue
 
-        logger.warning("Nenhuma linha OCR encontrada após todas as tentativas")
         return []
 
-    def _normalize_ocr_result_to_lines(self, result: Any) -> List[Dict]:
-        if result is None:
+    def _normalize_paddle2_result(self, result) -> List[Dict]:
+        """
+        PaddleOCR 2.x retorna algo como:
+          result = [ [ [box, (text, score)], ... ] ]  (por página)
+        ou às vezes:
+          result = [ [box, (text, score)], ... ]      (direto)
+        [web:87]
+        """
+        if not result:
             return []
 
-        # formato comum: [ [ [poly,(text,score)], ... ] ]
-        if isinstance(result, list) and result:
-            candidates = result[0] if isinstance(result[0], list) else result
-            out: List[Dict] = []
-            for item in candidates or []:
-                parsed = self._parse_single_ocr_item(item)
-                if parsed:
-                    out.append(parsed)
-            return out
+        page = result[0] if isinstance(result, list) and result and isinstance(result[0], list) else result
+        if not page:
+            return []
 
-        return []
+        out: List[Dict] = []
+        for item in page:
+            try:
+                # item = [box, (text, score)]
+                box = item[0]
+                rec = item[1]
+                text = str(rec[0]).strip()
+                conf = float(rec[1])
 
-    def _parse_single_ocr_item(self, item: Any) -> Optional[Dict]:
-        poly = None
-        text = None
-        conf = None
+                if not text or conf < 0.4:
+                    continue
 
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            poly = item[0]
-            rec = item[1]
-            if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                text = rec[0]
-                conf = rec[1]
+                x_pos, y_pos = self._xy_from_box(box)
 
-        if isinstance(item, dict):
-            poly = item.get("poly") or item.get("points") or item.get("box")
-            text = item.get("text")
-            conf = item.get("score") or item.get("confidence")
+                out.append(
+                    {
+                        "text": text.replace("×", "X"),
+                        "confidence": round(conf, 3),
+                        "y_position": int(y_pos),
+                        "x_position": int(x_pos) if x_pos is not None else None,
+                    }
+                )
+            except Exception:
+                continue
 
-        if text is None:
-            return None
+        return out
 
+    def _xy_from_box(self, box) -> (Optional[int], int):
+        """
+        box normalmente vem como 4 pontos: [[x,y],[x,y],[x,y],[x,y]] [web:87]
+        """
         try:
-            text = str(text).strip().replace("×", "X")
-        except Exception:
-            return None
-
-        try:
-            conf = float(conf) if conf is not None else 0.0
-        except Exception:
-            conf = 0.0
-
-        if not text or conf < 0.4:
-            return None
-
-        x_pos, y_pos = self._xy_from_poly(poly)
-
-        return {
-            "text": text,
-            "confidence": round(conf, 3),
-            "y_position": int(y_pos),
-            "x_position": int(x_pos) if x_pos is not None else None,
-        }
-
-    def _xy_from_poly(self, poly: Any) -> Tuple[Optional[int], int]:
-        try:
-            if poly is None:
-                return None, 0
-            xs = []
-            ys = []
-            for p in poly:
-                if isinstance(p, (list, tuple)) and len(p) >= 2:
-                    xs.append(int(p[0]))
-                    ys.append(int(p[1]))
+            xs = [int(p[0]) for p in box]
+            ys = [int(p[1]) for p in box]
             if not xs or not ys:
                 return None, 0
             return min(xs), min(ys)
@@ -350,6 +312,25 @@ class OCREngine:
             i = j
 
         return itens
+
+    # ---------------- Helpers ----------------
+    def _decode_image_bgr(self, image_bytes: bytes) -> Optional[np.ndarray]:
+        try:
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            return img
+        except Exception:
+            return None
+
+    def _threshold(self, img_bgr: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        return thr
+
+    def _to_bgr(self, img: np.ndarray) -> np.ndarray:
+        if len(img.shape) == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return img
 
     def _norm(self, s: str) -> str:
         s = (s or "").replace("×", "X")
