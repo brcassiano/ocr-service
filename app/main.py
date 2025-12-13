@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import logging
 
-from .ocrengine import OCREngine
+from .ocr_engine import OCREngine
 from .models import OCRResponse, QRCodeResponse, HealthResponse
 from .nfce_parser import NfceParserSP
 from . import version
