@@ -3,11 +3,9 @@ from pyzbar.pyzbar import decode
 
 import cv2
 import numpy as np
-
 import re
 
 from datetime import datetime
-
 from typing import List, Dict, Optional
 
 import logging
@@ -23,13 +21,37 @@ class OCREngine:
     COMMON_CORRECTIONS = {
         "ALHOTRADIC": "ALHO TRADIC",
         "QJ": "QUEIJO",
-        "BATATA LAVADA": "BATATA LAVADA",
     }
+
+    # Marcadores para cortar a área de itens (no seu cupom tem esses termos) [file:comp4.jpg]
+    ITEMS_HEADER_HINTS = [
+        "SQ.CODIGO",
+        "SQ. CODIGO",
+        "DESCRICAO",
+        "DESCRIÇÃO",
+        "QTD",
+        "VL.UNIT",
+        "VL. UNIT",
+        "TOTAL",
+    ]
+    STOP_HINTS = [
+        "QTD. TOTAL DE ITENS",
+        "QTD TOTAL DE ITENS",
+        "VALOR TOTAL",
+        "CARTAO",
+        "CARTÃO",
+        "CONSUMIDOR",
+        "CONSULTE PELA CHAVE",
+    ]
 
     def __init__(self, use_gpu: bool = False):
         self.debug_log: List[str] = []
         try:
-            params = {"use_angle_cls": False, "lang": "pt", "show_log": False}
+            params = {
+                "use_angle_cls": True,   # melhora em fotos tortas de cupom [file:comp4.jpg]
+                "lang": "pt",
+                "show_log": False,
+            }
             if use_gpu:
                 params["use_gpu"] = True
             self.ocr = PaddleOCR(**params)
@@ -162,6 +184,7 @@ class OCREngine:
                             }
                         )
 
+            # ordena por posição vertical
             lines.sort(key=lambda x: x["y_position"])
             return lines
 
@@ -183,142 +206,124 @@ class OCREngine:
         full_text = "\n".join([l.get("text", "") for l in ocr_lines])
         tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
 
-        # Remove rodapé a partir de "QTD. TOTAL DE ITENS" ou "VALOR TOTAL (R$)"
-        cleaned_lines: List[Dict] = []
-        stop = False
-        for l in ocr_lines:
-            t = l.get("text", "").upper()
-            if "QTD. TOTAL DE ITENS" in t or "VALOR TOTAL (R$)" in t:
-                stop = True
-            if not stop:
-                cleaned_lines.append(l)
+        # recorta para área provável de itens e remove rodapé [file:comp4.jpg]
+        item_lines = self._slice_item_area(ocr_lines)
 
-        itens = self._extract_items_by_header_blocks(cleaned_lines, tipo)
+        itens = self._extract_items_by_line_regex(item_lines, tipo)
 
         return {
             "tipo_documento": tipo,
             "itens": itens,
             "qrcode_url": qr_data[0]["data"] if qr_data else None,
-            "mensagem": None,
+            "mensagem": None if itens else "Nenhum item detectado",
             "confianca": 1.0 if itens else 0.0,
         }
 
-    # ---------------- PARSER POR CABEÇALHO NN CÓDIGO ----------------
-    def _extract_items_by_header_blocks(self, lines: List[Dict], tipo: str) -> List[Dict]:
-        """
-        Usa exclusivamente linhas que começam com 'NN CÓDIGO' como
-        delimitadores de bloco de item. Cada bloco é [header_i, header_{i+1}).
+    # ---------------- SLICE: ÁREA DE ITENS ----------------
+    def _slice_item_area(self, ocr_lines: List[Dict]) -> List[Dict]:
+        texts = [l.get("text", "") for l in ocr_lines]
+        upper = [t.upper().strip() for t in texts]
 
-        Dentro do bloco:
-        - descrição: primeira linha com letras que não seja UN/X/F nem só preço;
-        - quantidade: padrão '(\\d+[.,]?\\d*) UN' em alguma linha do bloco;
-        - unitário: valor após 'x' na linha da quantidade;
-        - total: preço na mesma linha da quantidade ou, em fallback,
-                 maior preço dentro do bloco (sem rodapé).
-        """
-        data_compra = self._extract_date("\n".join(l.get("text", "") for l in lines))
-        itens: List[Dict] = []
-
-        # só texto, preservando ordem original
-        texts = [l.get("text", "") for l in lines]
-
-        # índices de cabeçalho
-        header_indices: List[int] = []
-        header_pattern = re.compile(r"^\s*(\d{1,2})\s+(\d{8,14})")
-
-        for idx, text in enumerate(texts):
-            if header_pattern.match(text):
-                header_indices.append(idx)
-
-        if not header_indices:
-            return []
-
-        header_indices.append(len(texts))  # sentinela final
-
-        for h in range(len(header_indices) - 1):
-            start = header_indices[h]
-            end = header_indices[h + 1]
-            block_lines = texts[start:end]
-            if not block_lines:
-                continue
-
-            # remove o cabeçalho 'NN CODIGO' da primeira linha
-            first = header_pattern.sub("", block_lines[0]).strip()
-            block_rest = [first] + block_lines[1:]
-
-            # descrição: primeira linha com letras que não seja UN/X/F e não seja só preço
-            desc_raw = None
-            for t in block_rest:
-                t_stripped = t.strip()
-                if not t_stripped:
-                    continue
-                if not re.search(r"[A-Za-zÀ-Ü]", t_stripped):
-                    continue
-                upper = t_stripped.upper()
-                if upper in {"UN", "X", "F", "-"}:
-                    continue
-                if re.fullmatch(r"\d+[.,]\d{2}", t_stripped):
-                    continue
-                desc_raw = t_stripped
+        # encontra uma linha que pareça cabeçalho da tabela (contém DESCRICAO e QTD etc.) [file:comp4.jpg]
+        start_idx = 0
+        for i, t in enumerate(upper):
+            if ("DESCR" in t) and ("QTD" in t or "QT" in t) and ("TOTAL" in t or "VL" in t):
+                start_idx = i + 1
                 break
 
-            desc = self._clean_desc(desc_raw or "")
+        # encontra rodapé por hints [file:comp4.jpg]
+        end_idx = len(texts)
+        for i in range(start_idx, len(upper)):
+            if any(h in upper[i] for h in self.STOP_HINTS):
+                end_idx = i
+                break
 
-            # --------------- QUANTIDADE / UNITÁRIO / TOTAL ---------------
-            quantidade = 1.0
-            valor_unitario = None
-            valor_total = None
+        sliced = ocr_lines[start_idx:end_idx]
 
-            # linha de quantidade = primeira com " UN"
-            qtd_line = None
-            for t in block_rest:
-                if re.search(r"\bUN\b", t, flags=re.IGNORECASE):
-                    qtd_line = t
-                    break
+        # fallback extra: se ainda vier muita coisa, corta ao ver "QTD. TOTAL DE ITENS" etc.
+        cleaned: List[Dict] = []
+        for l in sliced:
+            t = (l.get("text", "") or "").upper()
+            if "QTD. TOTAL DE ITENS" in t or "VALOR TOTAL" in t:
+                break
+            cleaned.append(l)
 
-            if qtd_line:
-                # quantidade
-                qtd_match = re.search(r"(\d+[.,]?\d*)\s*UN", qtd_line, flags=re.IGNORECASE)
-                if qtd_match:
-                    try:
-                        quantidade = float(qtd_match.group(1).replace(",", "."))
-                    except ValueError:
-                        quantidade = 1.0
+        return cleaned
 
-                # preços nessa linha
-                prices_in_qtd = [
-                    float(p.replace(",", "."))
-                    for p in re.findall(r"\d+[.,]\d{2}", qtd_line)
-                ]
+    # ---------------- PARSER: POR LINHA (REGEX) ----------------
+    def _extract_items_by_line_regex(self, lines: List[Dict], tipo: str) -> List[Dict]:
+        """
+        Para cupons como o anexado, cada item geralmente cabe em uma única linha: [file:comp4.jpg]
+          NN CODIGO DESCRICAO ... QTD UN X VL_UNIT ST TOTAL
 
-                # unitário após 'x'
-                unit_match = re.search(r"[xX]\s*(\d+[.,]\d{2})", qtd_line)
-                if unit_match:
-                    try:
-                        valor_unitario = float(unit_match.group(1).replace(",", "."))
-                    except ValueError:
-                        valor_unitario = None
+        Estratégia:
+        - Filtrar linhas que começam com NN + código (8-14 dígitos).
+        - Extrair:
+          - descrição (lazy) até achar a quantidade+unidade
+          - quantidade + unidade (UN/KG/LT/...)
+          - unitário após X (opcional)
+          - total = último preço na linha
+        - Se unitário não existir, calcula total/qtd.
+        """
+        data_compra = self._extract_date("\n".join((l.get("text", "") or "") for l in lines))
 
-                # se tiver 2 preços na linha e já temos unitário, assume primeiro como total
-                if len(prices_in_qtd) >= 2 and valor_unitario is not None and valor_total is None:
-                    valor_total = prices_in_qtd[0]
-                elif len(prices_in_qtd) == 1 and valor_unitario is None:
-                    # só um preço na linha, sem 'x': assume total
-                    valor_total = prices_in_qtd[0]
+        # Normaliza pequenos ruídos comuns de OCR
+        def norm(s: str) -> str:
+            s = s.replace("×", "X")
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
 
-            # fallback: se ainda não tiver total, procura preços nas linhas do bloco
-            # (já sem rodapé, pois foi cortado em structure_data)
-            if valor_total is None:
-                safe_text = " ".join(block_rest)
-                prices_block = [
-                    float(p.replace(",", "."))
-                    for p in re.findall(r"\d+[.,]\d{2}", safe_text)
-                ]
-                if prices_block:
-                    # normalmente o maior preço do bloco é o total do item (ex: produtos a peso)
-                    valor_total = max(prices_block)
+        itens: List[Dict] = []
 
-            # se ainda não tiver unitário e tiver total + quantidade
+        # Ex.: "01 07891515546335 BATATA SADIA 1,05KG 1 UN X 15,89 T03 15,89" [file:comp4.jpg]
+        line_pattern = re.compile(
+            r"^\s*(?P<nn>\d{1,2})\s+(?P<code>\d{8,14})\s+"
+            r"(?P<body>.+?)\s*$"
+        )
+
+        # Dentro do body, localizar o trecho de quantidade/unidade e unitário opcional:
+        # aceita "1 UN X 15,89" ou "0,546 KG X 26,90" etc. [file:comp4.jpg]
+        qtd_pattern = re.compile(
+            r"(?P<desc>.+?)\s+"
+            r"(?P<qtd>\d+[.,]?\d*)\s*(?P<un>UN|KG|LT|L|PC|PCT|CX|FD)\b"
+            r"(?:\s*[xX]\s*(?P<unit>\d+[.,]\d{2}))?",
+            flags=re.IGNORECASE
+        )
+
+        money_pattern = re.compile(r"\d+[.,]\d{2}")
+
+        for l in lines:
+            raw = l.get("text", "") or ""
+            raw = norm(raw)
+            if not raw:
+                continue
+
+            m = line_pattern.match(raw)
+            if not m:
+                continue
+
+            body = m.group("body")
+
+            # total = último dinheiro na linha (mais estável pro layout do cupom) [file:comp4.jpg]
+            monies = money_pattern.findall(raw)
+            if not monies:
+                continue
+            valor_total = self._to_float(monies[-1])
+
+            qm = qtd_pattern.search(body)
+            if not qm:
+                # se OCR quebrou e não achou qtd, ignora (melhor do que inventar)
+                continue
+
+            desc_raw = qm.group("desc")
+            quantidade = self._to_float(qm.group("qtd")) or 1.0
+
+            unit_raw = qm.group("unit")
+            valor_unitario = self._to_float(unit_raw) if unit_raw else None
+
+            desc = self._clean_desc(desc_raw)
+
+            # se unitário não veio, calcula por total/qtd
             if valor_unitario is None and valor_total is not None and quantidade > 0:
                 valor_unitario = round(valor_total / quantidade, 2)
 
@@ -335,19 +340,35 @@ class OCREngine:
 
         return itens
 
+    # ---------------- HELPERS ----------------
+    def _to_float(self, s: Optional[str]) -> Optional[float]:
+        if not s:
+            return None
+        try:
+            return float(s.replace(".", "").replace(",", ".") if s.count(",") == 1 and s.count(".") > 1 else s.replace(",", "."))
+        except Exception:
+            try:
+                return float(s.replace(",", "."))
+            except Exception:
+                return None
+
     def _clean_desc(self, desc: str) -> str:
         if not desc:
             return "ITEM DESCONHECIDO"
 
+        # remove lixo inicial (se algum dia entrar NN etc.)
         desc = re.sub(r"^\d+\s*", "", desc)
+
+        # remove sufixos de unidade soltos
         desc = re.sub(r"\s+(UN|KG|LT|PC|L|M)\s*$", "", desc, flags=re.IGNORECASE)
-        desc = re.sub(r"\s*[xX]\s*\d+[.,]\d{2}.*$", "", desc)
-        desc = re.sub(r"\s*(T\d{2,3}|F)\s*\d+[.,]\d{2}.*$", "", desc)
+
+        # normaliza espaços e upper
         desc = re.sub(r"\s+", " ", desc).strip().upper()
+
+        # remove caracteres estranhos
         desc = re.sub(r"[^A-Z0-9À-Ü\s\-.,/]", "", desc)
 
-        # se sobrou só UN/X/F/-, trata como desconhecido
-        if desc in {"UN", "X", "F", "-"}:
+        if desc in {"UN", "X", "F", "-", ""}:
             return "ITEM DESCONHECIDO"
 
         for wrong, right in self.COMMON_CORRECTIONS.items():
@@ -362,10 +383,8 @@ class OCREngine:
             r"emiss[aã]o[:\s]*(\d{2}/\d{2}/\d{4})",
             r"(\d{2}/\d{2}/\d{4})",
         ]
-
         for p in patterns:
             m = re.search(p, text, re.IGNORECASE)
             if m:
                 return m.group(1)
-
         return datetime.now().strftime("%d/%m/%Y")
