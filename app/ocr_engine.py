@@ -380,7 +380,9 @@ class OCREngine:
 
         desc = desc.upper()
         desc = re.sub(r"\s+", " ", desc).strip()
-        desc = re.sub(r"[^A-Z0-9À-Ü\s\\-.,/]", "", desc)
+
+        # FIX: hífen no final do charset para não virar range inválido
+        desc = re.sub(r"[^A-Z0-9À-Ü\s\\.,/-]", "", desc)
 
         for wrong, right in self.COMMON_CORRECTIONS.items():
             if wrong in desc:
@@ -390,6 +392,7 @@ class OCREngine:
             return "ITEM DESCONHECIDO"
 
         return desc
+
 
     def _extract_date(self, text: str) -> str:
         patterns = [
