@@ -26,16 +26,14 @@ class OCREngine:
         "PROTOCOLO",
     ]
 
-    # "01 07891515546335BATATA SADIA1,05KG"
     RE_ITEM_HEADER = re.compile(r"^\s*(?P<sq>\d{2})\s+(?P<code>\d{8,14})(?P<desc>.*)$")
 
-    # "1UNx15,89" | "0,546KGx26,90" | "1 UN x 14,99"
+    # qtd/un/valor: funciona tanto no bloco do meio quanto quando vem grudado no bloco esquerdo
     RE_QTD_X_UNIT = re.compile(
         r"(?P<qtd>\d+(?:[.,]\d+)?)\s*(?P<un>[A-Z]{1,3})\s*[xX]\s*(?P<vl>\d+(?:[.,]\d{2}))",
         re.IGNORECASE,
     )
 
-    # dinheiro BR
     RE_MONEY = re.compile(r"\d+(?:[.,]\d{2})")
 
     COMMON_CORRECTIONS = {
@@ -174,11 +172,10 @@ class OCREngine:
             "confianca": 1.0 if itens else 0.0,
         }
 
-    # ---------- NFC-e SP: por colunas + janela 2 linhas ----------
     def _extract_items_nfce_sp_by_columns(self, ocr_lines: List[Dict], tipo: str, full_text: str) -> List[Dict]:
         data_compra = self._extract_date(full_text)
 
-        # encontra faixa de itens (entre "SQ.CODIGO" e "QTD TOTAL...")
+        # faixa de itens
         start_y = 0
         for t in ocr_lines:
             up = (t.get("text") or "").upper()
@@ -195,28 +192,23 @@ class OCREngine:
 
         tokens = [t for t in ocr_lines if start_y <= t["y_position"] <= end_y]
 
-        # thresholds de coluna (ajustados pelo seu exemplo)
+        # colunas (do seu exemplo)
         X_LEFT_MAX = 620
         X_MID_MIN = 620
         X_RIGHT_MIN = 900
 
-        # y tolerance para “linha” (menor para não misturar itens)
-        y_groups = self._group_by_y(tokens, y_tol=6)
+        groups = self._group_by_y(tokens, y_tol=6)
 
-        # índice por y_ref pra buscar “próxima linha”
-        y_refs = [g["y_ref"] for g in y_groups]
-
-        def nearest_next_group(idx: int, max_delta: int = 16) -> Optional[Dict]:
-            if idx + 1 >= len(y_groups):
+        def next_group(i: int, max_delta: int = 18) -> Optional[Dict]:
+            if i + 1 >= len(groups):
                 return None
-            if y_groups[idx + 1]["y_ref"] - y_groups[idx]["y_ref"] <= max_delta:
-                return y_groups[idx + 1]
+            if groups[i + 1]["y_ref"] - groups[i]["y_ref"] <= max_delta:
+                return groups[i + 1]
             return None
 
-        itens: List[Dict] = []
+        itens_by_sq: Dict[str, Dict] = {}
 
-        for i, g in enumerate(y_groups):
-            # pega apenas tokens da coluna esquerda e tenta detectar header
+        for i, g in enumerate(groups):
             left_tokens = [t for t in g["tokens"] if (t["x_position"] or 0) < X_LEFT_MAX]
             if not left_tokens:
                 continue
@@ -230,63 +222,114 @@ class OCREngine:
             desc_raw = m.group("desc") or ""
             desc = self._clean_desc(desc_raw)
 
-            # juntar bloco do meio (qtd x vl_unit) da linha atual
+            # 1) tentar qtd/vl_unit do meio
             mid_tokens = [t for t in g["tokens"] if X_MID_MIN <= (t["x_position"] or 0) < X_RIGHT_MIN]
             mid_text = self._norm_text(" ".join([t["text"] for t in mid_tokens]))
             q = self.RE_QTD_X_UNIT.search(mid_text)
 
+            # 2) fallback: às vezes vem grudado no bloco esquerdo (ex.: "0,546KGx26,90T03")
+            if not q:
+                q = self.RE_QTD_X_UNIT.search(left_text)
+
             quantidade = self._to_float(q.group("qtd")) if q else None
             valor_unitario = self._to_float(q.group("vl")) if q else None
 
-            # total: preferir coluna direita da mesma linha; se não tiver, olhar a próxima linha (coluna direita)
+            # 3) total: coluna direita da mesma linha -> senão coluna direita da linha de baixo
+            valor_total = None
             right_tokens = [t for t in g["tokens"] if (t["x_position"] or 0) >= X_RIGHT_MIN]
-            right_text = self._norm_text(" ".join([t["text"] for t in right_tokens]))
-            monies = self.RE_MONEY.findall(right_text)
-            valor_total = self._to_float(monies[-1]) if monies else None
+            valor_total = self._parse_total_from_tokens(right_tokens)
 
             if valor_total is None:
-                g2 = nearest_next_group(i, max_delta=18)  # no seu exemplo total vem ~8px abaixo
+                g2 = next_group(i, max_delta=18)
                 if g2:
                     right_tokens_2 = [t for t in g2["tokens"] if (t["x_position"] or 0) >= X_RIGHT_MIN]
-                    right_text_2 = self._norm_text(" ".join([t["text"] for t in right_tokens_2]))
-                    monies2 = self.RE_MONEY.findall(right_text_2)
-                    valor_total = self._to_float(monies2[-1]) if monies2 else None
+                    valor_total = self._parse_total_from_tokens(right_tokens_2)
 
-            # filtros anti-lixo: precisa ter total e descrição minimamente plausível
+            # 4) fallback final: se não achou total, mas qtd==1 e tem vl_unit => total = vl_unit
+            if valor_total is None and valor_unitario is not None:
+                if quantidade is None or abs(quantidade - 1.0) < 1e-6:
+                    valor_total = valor_unitario
+
+            # filtros mínimos
             if not desc or desc == "ITEM DESCONHECIDO":
                 continue
             if valor_total is None:
                 continue
 
-            # se qtd/vl_unit faltou, tenta derivar
             if quantidade is None:
                 quantidade = 1.0
             if valor_unitario is None and quantidade and quantidade > 0:
                 valor_unitario = round(valor_total / quantidade, 2)
 
-            itens.append(
-                {
-                    "item": desc,
-                    "quantidade": float(quantidade) if quantidade is not None else None,
-                    "valor_unitario": float(valor_unitario) if valor_unitario is not None else None,
-                    "valor_total": float(valor_total),
-                    "data_compra": data_compra if tipo == "gasto" else None,
-                    "data_venda": data_compra if tipo == "venda" else None,
-                    "sq": sq,
-                }
-            )
+            # dedupe por SQ: se já existe, mantém o que tem mais campos preenchidos
+            candidate = {
+                "item": desc,
+                "quantidade": float(quantidade) if quantidade is not None else None,
+                "valor_unitario": float(valor_unitario) if valor_unitario is not None else None,
+                "valor_total": float(valor_total),
+                "data_compra": data_compra if tipo == "gasto" else None,
+                "data_venda": data_compra if tipo == "venda" else None,
+                "_sq": sq,
+            }
 
-        # opcional: ordenar por SQ
+            prev = itens_by_sq.get(sq)
+            if not prev:
+                itens_by_sq[sq] = candidate
+            else:
+                prev_score = self._item_score(prev)
+                cand_score = self._item_score(candidate)
+                if cand_score >= prev_score:
+                    itens_by_sq[sq] = candidate
+
+        # ordenar por sq
+        itens = list(itens_by_sq.values())
         try:
-            itens.sort(key=lambda it: int(it.get("sq", "999")))
+            itens.sort(key=lambda it: int(it["_sq"]))
         except Exception:
             pass
-
-        # remover campo interno sq antes de devolver
         for it in itens:
-            it.pop("sq", None)
-
+            it.pop("_sq", None)
         return itens
+
+    def _parse_total_from_tokens(self, tokens: List[Dict]) -> Optional[float]:
+        """
+        Total é tipicamente 1 token tipo '15,89', mas às vezes vem OCR zoado tipo 66'9.
+        Aqui normaliza alguns erros comuns e tenta converter.
+        """
+        if not tokens:
+            return None
+
+        raw = self._norm_text(" ".join([t["text"] for t in tokens]))
+
+        # tenta normal
+        monies = self.RE_MONEY.findall(raw)
+        if monies:
+            return self._to_float(monies[-1])
+
+        # fallback OCR: 66'9 => 6,69 ou 66,9 (ambíguo). Para NFC-e, quase sempre 2 casas.
+        # Regra: se tem 3 dígitos e um separador estranho, assume última é centavo: "669" => "6,69"
+        cleaned = raw.replace("'", "").replace("`", "").replace(" ", "")
+        cleaned = re.sub(r"[^0-9]", "", cleaned)
+        if len(cleaned) == 3:
+            guess = f"{cleaned[0]},{cleaned[1:]}"
+            return self._to_float(guess)
+        if len(cleaned) == 4:
+            guess = f"{cleaned[:-2]},{cleaned[-2:]}"
+            return self._to_float(guess)
+
+        return None
+
+    def _item_score(self, it: Dict) -> int:
+        score = 0
+        if it.get("item"):
+            score += 1
+        if it.get("quantidade") is not None:
+            score += 1
+        if it.get("valor_unitario") is not None:
+            score += 1
+        if it.get("valor_total") is not None:
+            score += 1
+        return score
 
     def _group_by_y(self, tokens: List[Dict], y_tol: int = 6) -> List[Dict]:
         toks = sorted(tokens, key=lambda t: (t["y_position"], t["x_position"] if t["x_position"] is not None else 10**9))
@@ -331,7 +374,6 @@ class OCREngine:
     def _norm_text(self, s: str) -> str:
         s = (s or "").replace("×", "X")
         s = re.sub(r"\s+", " ", s).strip()
-        # correções simples
         for wrong, right in self.COMMON_CORRECTIONS.items():
             s = s.replace(wrong, right)
         return s
