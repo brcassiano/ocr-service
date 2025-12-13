@@ -26,37 +26,30 @@ class OCREngine:
         "PROTOCOLO",
     ]
 
-    # cabeçalho de item: "01 07891515546335BATATA ..."
-    RE_ITEM_HEADER = re.compile(r"^\s*(?P<sq>\d{2})\s+(?P<code>\d{8,14})\s*(?P<desc>.+)$")
+    # "01 07891515546335BATATA SADIA1,05KG"
+    RE_ITEM_HEADER = re.compile(r"^\s*(?P<sq>\d{2})\s+(?P<code>\d{8,14})(?P<desc>.*)$")
 
-    # pega "1UNx15,89" | "0,546KGx26,90" | "1 UH x 14,99" | variações com espaços
-    RE_QTD_UNIT_X_VLUNIT = re.compile(
+    # "1UNx15,89" | "0,546KGx26,90" | "1 UN x 14,99"
+    RE_QTD_X_UNIT = re.compile(
         r"(?P<qtd>\d+(?:[.,]\d+)?)\s*(?P<un>[A-Z]{1,3})\s*[xX]\s*(?P<vl>\d+(?:[.,]\d{2}))",
         re.IGNORECASE,
     )
 
-    # dinheiro BR: 15,89 / 236,09 etc
+    # dinheiro BR
     RE_MONEY = re.compile(r"\d+(?:[.,]\d{2})")
 
     COMMON_CORRECTIONS = {
         "ZER0": "ZERO",
         "I0G": "IOG",
         "OUOS": "OVOS",
-        "PA0": "PAO",
-        "P.QUEI.JO": "P.QUEIJO",
-        "P.QUEIJ0": "P.QUEIJO",
         "UOS": "OVOS",
         "UH": "UN",
-        "UL.UNIT": "VL.UNIT",
-        "UL.UNIT": "VL.UNIT",
+        "1Ux": "1UNx",
+        "SUIFT": "SWIFT",
     }
 
     def __init__(self, use_gpu: bool = False):
-        params = {
-            "use_angle_cls": True,
-            "lang": "pt",
-            "show_log": False,
-        }
+        params = {"use_angle_cls": True, "lang": "pt", "show_log": False}
         if use_gpu:
             params["use_gpu"] = True
         self.ocr = PaddleOCR(**params)
@@ -121,7 +114,6 @@ class OCREngine:
     def _normalize_paddle2_result(self, result) -> List[Dict]:
         if not result:
             return []
-
         page = result[0] if isinstance(result, list) and result and isinstance(result[0], list) else result
         if not page:
             return []
@@ -133,10 +125,8 @@ class OCREngine:
                 rec = item[1]
                 text = str(rec[0]).strip()
                 conf = float(rec[1])
-
                 if not text or conf < 0.35:
                     continue
-
                 x_pos, y_pos = self._xy_from_box(box)
                 out.append(
                     {
@@ -148,7 +138,6 @@ class OCREngine:
                 )
             except Exception:
                 continue
-
         return out
 
     def _xy_from_box(self, box) -> Tuple[Optional[int], int]:
@@ -175,7 +164,7 @@ class OCREngine:
         full_text = "\n".join([l.get("text", "") for l in ocr_lines])
         tipo = "venda" if any(k in full_text.lower() for k in self.KEYWORDS_VENDA) else "gasto"
 
-        itens = self._extract_items_nfce_sp_layout(ocr_lines, tipo, full_text)
+        itens = self._extract_items_nfce_sp_by_columns(ocr_lines, tipo, full_text)
 
         return {
             "tipo_documento": tipo,
@@ -185,157 +174,140 @@ class OCREngine:
             "confianca": 1.0 if itens else 0.0,
         }
 
-    # ----------- parser determinístico NFC-e SP (por colunas) -----------
-    def _extract_items_nfce_sp_layout(self, ocr_lines: List[Dict], tipo: str, full_text: str) -> List[Dict]:
-        """
-        Regras:
-        - Cada item começa com "SQ CODIGO ..." (SQ 2 dígitos).
-        - Na mesma linha visual (mesmo y) aparecem tokens adicionais: QTD x VLUNIT (com UN/KG) e TOTAL (às vezes separado).
-        - Para cada item: pega sq, descricao, qtd, vl_unit e total.
-        """
+    # ---------- NFC-e SP: por colunas + janela 2 linhas ----------
+    def _extract_items_nfce_sp_by_columns(self, ocr_lines: List[Dict], tipo: str, full_text: str) -> List[Dict]:
         data_compra = self._extract_date(full_text)
 
-        # 1) recorta área de itens: depois do cabeçalho "SQ.CODIGO"
-        start_y = None
-        end_y = None
+        # encontra faixa de itens (entre "SQ.CODIGO" e "QTD TOTAL...")
+        start_y = 0
         for t in ocr_lines:
             up = (t.get("text") or "").upper()
             if "SQ.CODIGO" in up or "SQ. CODIGO" in up:
-                start_y = t.get("y_position", 0)
+                start_y = t.get("y_position", 0) + 5
                 break
 
-        if start_y is None:
-            start_y = 0
-
+        end_y = 10**9
         for t in ocr_lines:
             up = (t.get("text") or "").upper()
             if any(h in up for h in self.STOP_HINTS):
-                end_y = t.get("y_position", 10**9)
+                end_y = t.get("y_position", 10**9) - 5
                 break
 
-        if end_y is None:
-            end_y = 10**9
+        tokens = [t for t in ocr_lines if start_y <= t["y_position"] <= end_y]
 
-        tokens = [t for t in ocr_lines if start_y + 5 <= t["y_position"] <= end_y - 5]
+        # thresholds de coluna (ajustados pelo seu exemplo)
+        X_LEFT_MAX = 620
+        X_MID_MIN = 620
+        X_RIGHT_MIN = 900
 
-        # 2) agrupa por linha visual usando y tolerance
-        grouped = self._group_by_y(tokens, y_tol=10)
+        # y tolerance para “linha” (menor para não misturar itens)
+        y_groups = self._group_by_y(tokens, y_tol=6)
+
+        # índice por y_ref pra buscar “próxima linha”
+        y_refs = [g["y_ref"] for g in y_groups]
+
+        def nearest_next_group(idx: int, max_delta: int = 16) -> Optional[Dict]:
+            if idx + 1 >= len(y_groups):
+                return None
+            if y_groups[idx + 1]["y_ref"] - y_groups[idx]["y_ref"] <= max_delta:
+                return y_groups[idx + 1]
+            return None
 
         itens: List[Dict] = []
-        current = None
 
-        def flush():
-            nonlocal current
-            if not current:
-                return
-            # valida mínimos
-            if current.get("descricao") and current.get("valor_total") is not None:
-                itens.append(
-                    {
-                        "item": current["descricao"],
-                        "quantidade": current.get("quantidade"),
-                        "valor_unitario": current.get("valor_unitario"),
-                        "valor_total": current.get("valor_total"),
-                        "data_compra": data_compra if tipo == "gasto" else None,
-                        "data_venda": data_compra if tipo == "venda" else None,
-                    }
-                )
-            current = None
-
-        for line in grouped:
-            # line: tokens da mesma linha visual, ordenados por x
-            text_join = " ".join([tok["text"] for tok in line]).strip()
-            text_join = self._norm_text(text_join)
-
-            # ignora cabeçalhos
-            up = text_join.upper()
-            if "DESCRICAO" in up and "TOTAL" in up:
+        for i, g in enumerate(y_groups):
+            # pega apenas tokens da coluna esquerda e tenta detectar header
+            left_tokens = [t for t in g["tokens"] if (t["x_position"] or 0) < X_LEFT_MAX]
+            if not left_tokens:
                 continue
 
-            m = self.RE_ITEM_HEADER.match(text_join)
-            if m:
-                # novo item: flush o anterior
-                flush()
+            left_text = self._norm_text(" ".join([t["text"] for t in left_tokens]))
+            m = self.RE_ITEM_HEADER.match(left_text)
+            if not m:
+                continue
 
-                sq = m.group("sq")
-                desc_part = m.group("desc")
+            sq = m.group("sq")
+            desc_raw = m.group("desc") or ""
+            desc = self._clean_desc(desc_raw)
 
-                # desc_part pode vir grudado com o código (sem espaço); já está no grupo desc
-                desc = self._clean_desc(desc_part)
+            # juntar bloco do meio (qtd x vl_unit) da linha atual
+            mid_tokens = [t for t in g["tokens"] if X_MID_MIN <= (t["x_position"] or 0) < X_RIGHT_MIN]
+            mid_text = self._norm_text(" ".join([t["text"] for t in mid_tokens]))
+            q = self.RE_QTD_X_UNIT.search(mid_text)
 
-                current = {
+            quantidade = self._to_float(q.group("qtd")) if q else None
+            valor_unitario = self._to_float(q.group("vl")) if q else None
+
+            # total: preferir coluna direita da mesma linha; se não tiver, olhar a próxima linha (coluna direita)
+            right_tokens = [t for t in g["tokens"] if (t["x_position"] or 0) >= X_RIGHT_MIN]
+            right_text = self._norm_text(" ".join([t["text"] for t in right_tokens]))
+            monies = self.RE_MONEY.findall(right_text)
+            valor_total = self._to_float(monies[-1]) if monies else None
+
+            if valor_total is None:
+                g2 = nearest_next_group(i, max_delta=18)  # no seu exemplo total vem ~8px abaixo
+                if g2:
+                    right_tokens_2 = [t for t in g2["tokens"] if (t["x_position"] or 0) >= X_RIGHT_MIN]
+                    right_text_2 = self._norm_text(" ".join([t["text"] for t in right_tokens_2]))
+                    monies2 = self.RE_MONEY.findall(right_text_2)
+                    valor_total = self._to_float(monies2[-1]) if monies2 else None
+
+            # filtros anti-lixo: precisa ter total e descrição minimamente plausível
+            if not desc or desc == "ITEM DESCONHECIDO":
+                continue
+            if valor_total is None:
+                continue
+
+            # se qtd/vl_unit faltou, tenta derivar
+            if quantidade is None:
+                quantidade = 1.0
+            if valor_unitario is None and quantidade and quantidade > 0:
+                valor_unitario = round(valor_total / quantidade, 2)
+
+            itens.append(
+                {
+                    "item": desc,
+                    "quantidade": float(quantidade) if quantidade is not None else None,
+                    "valor_unitario": float(valor_unitario) if valor_unitario is not None else None,
+                    "valor_total": float(valor_total),
+                    "data_compra": data_compra if tipo == "gasto" else None,
+                    "data_venda": data_compra if tipo == "venda" else None,
                     "sq": sq,
-                    "descricao": desc,
-                    "quantidade": None,
-                    "valor_unitario": None,
-                    "valor_total": None,
                 }
+            )
 
-                # tenta achar total na mesma linha (às vezes aparece no final)
-                monies = self.RE_MONEY.findall(text_join)
-                if monies:
-                    current["valor_total"] = self._to_float(monies[-1])
+        # opcional: ordenar por SQ
+        try:
+            itens.sort(key=lambda it: int(it.get("sq", "999")))
+        except Exception:
+            pass
 
-                # tenta achar qtd/vl_unit na mesma linha (às vezes vem grudado tipo "...0,546KGx26,90T03")
-                q = self.RE_QTD_UNIT_X_VLUNIT.search(text_join)
-                if q:
-                    current["quantidade"] = self._to_float(q.group("qtd"))
-                    current["valor_unitario"] = self._to_float(q.group("vl"))
+        # remover campo interno sq antes de devolver
+        for it in itens:
+            it.pop("sq", None)
 
-                continue
-
-            # linhas complementares: só processa se já existe item aberto
-            if not current:
-                continue
-
-            # 1) total isolado (token tipo "15,89")
-            monies = self.RE_MONEY.findall(text_join)
-            if monies:
-                # regra: se só tem 1 valor monetário e current.total ainda vazio, assume total
-                if len(monies) == 1 and current.get("valor_total") is None:
-                    current["valor_total"] = self._to_float(monies[0])
-                # se tem mais de um, pega o último como total (padrão NFC-e)
-                elif len(monies) >= 2:
-                    current["valor_total"] = self._to_float(monies[-1])
-
-            # 2) qtd e vl_unit (token tipo "1UNx15,89T03" ou "1UN x28,90 T04")
-            q = self.RE_QTD_UNIT_X_VLUNIT.search(text_join)
-            if q:
-                current["quantidade"] = self._to_float(q.group("qtd"))
-                current["valor_unitario"] = self._to_float(q.group("vl"))
-
-            # Heurística: quando já tem total e (qtd ou vl_unit), pode fechar item ao encontrar próxima linha
-            # (não flush aqui; flush ocorre ao detectar próximo header ou no final)
-
-        flush()
         return itens
 
-    def _group_by_y(self, tokens: List[Dict], y_tol: int = 10) -> List[List[Dict]]:
-        # ordena por y e agrupa por proximidade
+    def _group_by_y(self, tokens: List[Dict], y_tol: int = 6) -> List[Dict]:
         toks = sorted(tokens, key=lambda t: (t["y_position"], t["x_position"] if t["x_position"] is not None else 10**9))
-        groups: List[List[Dict]] = []
-        refs: List[int] = []
+        groups: List[Dict] = []
 
         for t in toks:
             y = int(t["y_position"])
             placed = False
-            for idx, yref in enumerate(refs):
-                if abs(y - yref) <= y_tol:
-                    groups[idx].append(t)
-                    # atualiza referência (média simples)
-                    refs[idx] = int((refs[idx] + y) / 2)
+            for g in groups:
+                if abs(y - g["y_ref"]) <= y_tol:
+                    g["tokens"].append(t)
+                    g["y_ref"] = int((g["y_ref"] + y) / 2)
                     placed = True
                     break
             if not placed:
-                groups.append([t])
-                refs.append(y)
+                groups.append({"y_ref": y, "tokens": [t]})
 
-        # ordena cada grupo por x
         for g in groups:
-            g.sort(key=lambda t: t["x_position"] if t["x_position"] is not None else 10**9)
+            g["tokens"].sort(key=lambda t: t["x_position"] if t["x_position"] is not None else 10**9)
 
-        # ordena grupos por yref
-        groups = [g for _, g in sorted(zip(refs, groups), key=lambda x: x[0])]
+        groups.sort(key=lambda g: g["y_ref"])
         return groups
 
     # ---------------- Helpers ----------------
@@ -359,6 +331,7 @@ class OCREngine:
     def _norm_text(self, s: str) -> str:
         s = (s or "").replace("×", "X")
         s = re.sub(r"\s+", " ", s).strip()
+        # correções simples
         for wrong, right in self.COMMON_CORRECTIONS.items():
             s = s.replace(wrong, right)
         return s
@@ -368,7 +341,6 @@ class OCREngine:
             return None
         s = s.strip().replace(" ", "")
         try:
-            # normaliza "1.234,56" e "1234,56" e "1234.56"
             if s.count(",") == 1 and s.count(".") >= 1:
                 s = s.replace(".", "").replace(",", ".")
             else:
@@ -378,9 +350,7 @@ class OCREngine:
             return None
 
     def _clean_desc(self, desc: str) -> str:
-        if not desc:
-            return "ITEM DESCONHECIDO"
-        desc = desc.upper()
+        desc = (desc or "").upper()
         desc = re.sub(r"\s+", " ", desc).strip()
         desc = re.sub(r"[^A-Z0-9À-Ü\s\.,/-]", "", desc)
         for wrong, right in self.COMMON_CORRECTIONS.items():
