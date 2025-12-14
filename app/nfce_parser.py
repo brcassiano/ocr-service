@@ -13,10 +13,9 @@ class NfceParserSP:
     Parser NFC-e SP a partir do link do QRCode.
 
     Estratégia:
-    1) Tenta baixar HTML via requests (rápido e barato).
-    2) Faz parse dos itens do HTML.
-    3) Só se não encontrar itens (ou sessão expirada) tenta Playwright.
-       Se Playwright não estiver instalado, retorna erro amigável.
+    - requests -> parse HTML
+    - extrai itens por DOM; se falhar, extrai por regex no texto completo.
+    - Playwright vira apenas fallback opcional (se instalado).
     """
 
     def __init__(self, timeout: int = 25):
@@ -27,7 +26,6 @@ class NfceParserSP:
             "Chrome/120.0.0.0 Safari/537.36"
         )
 
-    # --------- Fetch (STATIC) ----------
     def fetch_html_static(self, url: str) -> str:
         url_clean = url.split("|")[0] if "|" in url else url
         logger.info(f"Baixando HTML (requests) para: {url_clean[:60]}...")
@@ -39,10 +37,8 @@ class NfceParserSP:
         logger.info(f"HTML estático baixado: status={resp.status_code} len={len(resp.text)}")
         return resp.text
 
-    # --------- Fetch (DYNAMIC) ----------
     async def fetch_html_dynamic(self, url: str) -> str:
-        # import atrasado (só se precisar)
-        from playwright.async_api import async_playwright
+        from playwright.async_api import async_playwright  # import atrasado
 
         url_clean = url.split("|")[0] if "|" in url else url
         logger.info(f"Abrindo navegador (Playwright) para: {url_clean[:60]}...")
@@ -52,48 +48,32 @@ class NfceParserSP:
             try:
                 context = await browser.new_context(user_agent=self.user_agent)
                 page = await context.new_page()
-
                 await page.goto(url_clean, timeout=30000, wait_until="domcontentloaded")
                 try:
                     await page.wait_for_selector("table", timeout=10000)
                 except Exception:
                     logger.warning("Timeout esperando tabela. Tentando ler o que carregou...")
-
                 html = await page.content()
                 logger.info(f"HTML dinâmico carregado len={len(html)}")
                 return html
             finally:
                 await browser.close()
 
-    # --------- Parse ----------
     async def parse(self, url: str) -> Dict:
-        html = None
-
-        # 1) tenta requests
+        # 1) requests
         try:
             html = self.fetch_html_static(url)
         except Exception as e:
             logger.warning(f"Falha fetch estático: {e}")
             html = None
 
-        # 2) tenta parsear itens do HTML estático (se veio)
+        # 2) tenta parse no estático
         if html and not self._is_session_expired(html):
             soup = BeautifulSoup(html, "html.parser")
-
-            # sinais “reais” de que a página tem itens
-            signals = {
-                "txtTit": bool(soup.select_one(".txtTit")),
-                "valor": bool(soup.select_one(".valor")),
-                "codigo_text": "(Código:" in soup.get_text(" ", strip=True),
-                "vl_total_text": "Vl. Total" in soup.get_text(" ", strip=True),
-            }
-            logger.info(f"Static signals: {signals}")
-
             data_compra = self._extract_date(soup)
             itens = self._extract_items_sp(soup, data_compra)
             total_nota = self._extract_total(soup)
 
-            # Se achou itens, já retorna e não tenta Playwright
             if itens:
                 return {
                     "tipo_documento": "gasto",
@@ -103,7 +83,7 @@ class NfceParserSP:
                     "origem": "nfce_sp_qrcode_static",
                 }
 
-        # 3) se sessão expirada ou não achou itens, tenta Playwright (se existir)
+        # 3) fallback Playwright (se existir)
         try:
             html = await self.fetch_html_dynamic(url)
         except ModuleNotFoundError:
@@ -148,28 +128,36 @@ class NfceParserSP:
             "origem": "nfce_sp_qrcode_browser",
         }
 
-    # --------- Helpers ----------
+    # ---------------- helpers ----------------
     def _is_session_expired(self, html: str) -> bool:
         h = (html or "").lower()
         return ("sessão expirou" in h) or ("sessao expirou" in h)
 
     def _extract_date(self, soup: BeautifulSoup) -> Optional[str]:
+        # Emissão: 11/12/2025 18:57:55
+        m = re.search(r"Emissão:\s*(\d{2}/\d{2}/\d{4})", soup.get_text(" ", strip=True), re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+        # fallback antigo
         for strong in soup.find_all("strong"):
             if "Emissão" in strong.get_text():
                 text = strong.parent.get_text()
-                m = re.search(r"(\d{2}/\d{2}/\d{4})", text)
-                if m:
-                    return m.group(1)
-
-        m = re.search(r"Emissão[:\s]*(\d{2}/\d{2}/\d{4})", soup.get_text(), re.IGNORECASE)
-        if m:
-            return m.group(1)
+                m2 = re.search(r"(\d{2}/\d{2}/\d{4})", text)
+                if m2:
+                    return m2.group(1)
 
         return None
 
     def _extract_items_sp(self, soup: BeautifulSoup, data_compra: Optional[str]) -> List[Dict]:
+        """
+        Tenta 2 estratégias:
+        A) DOM (tr/td + classes txtTit/valor)
+        B) Regex no texto completo (muito robusto pro layout SP)
+        """
         itens: List[Dict] = []
 
+        # ---------- A) DOM ----------
         rows = soup.find_all("tr", id=re.compile(r"Item"))
         if not rows:
             table = soup.find("table", {"id": "tabResult"})
@@ -183,51 +171,25 @@ class NfceParserSP:
             if not text_row:
                 continue
 
-            # precisa ter algum indício de item
+            # indícios
             if "(Código:" not in text_row and "Vl. Total" not in text_row and "Vl.Total" not in text_row:
                 continue
 
             nome_elem = row.find(class_="txtTit") or row.find(class_="fixo-prod-serv-descricao")
             nome = nome_elem.get_text(strip=True) if nome_elem else None
-
-            # fallback: quando não existir txtTit, corta antes do "(Código:"
             if not nome and "(Código:" in text_row:
                 nome = text_row.split("(Código:")[0].strip()
 
-            if not nome:
-                continue
-            if "Descrição" in nome or "Qtde" in nome:
+            if not nome or "Descrição" in nome or "Qtde" in nome:
                 continue
 
-            # quantidade
-            qtd = 1.0
-            m_qtd = re.search(r"Qtde\.?\:?\s*([0-9,.]+)", text_row, re.IGNORECASE)
-            if m_qtd:
-                try:
-                    qtd = float(m_qtd.group(1).replace(",", "."))
-                except Exception:
-                    qtd = 1.0
+            qtd = self._extract_float(text_row, r"Qtde\.?\:?\s*([0-9,.]+)") or 1.0
+            valor_unit = self._extract_float(text_row, r"Vl\.\s*Unit\.\:?\s*([0-9,.]+)")
+            if valor_unit is None:
+                valor_unit = self._extract_float(text_row, r"Unit\.?\:?\s*([0-9,.]+)")
 
-            # valor unitário (padrão SP: "Vl. Unit.")
-            valor_unit = None
-            m_unit = re.search(r"Vl\.\s*Unit\.\:?\s*([0-9,.]+)", text_row, re.IGNORECASE)
-            if not m_unit:
-                m_unit = re.search(r"Unit\.?\:?\s*([0-9,.]+)", text_row, re.IGNORECASE)
-            if m_unit:
-                try:
-                    valor_unit = float(m_unit.group(1).replace(",", "."))
-                except Exception:
-                    valor_unit = None
-
-            # valor total (preferir "Vl. Total")
-            valor_total = None
-            m_total = re.search(r"Vl\.\s*Total\s*([0-9,.]+)", text_row, re.IGNORECASE)
-            if m_total:
-                try:
-                    valor_total = float(m_total.group(1).replace(",", "."))
-                except Exception:
-                    valor_total = None
-            else:
+            valor_total = self._extract_float(text_row, r"Vl\.\s*Total\s*([0-9,.]+)")
+            if valor_total is None:
                 matches = re.findall(r"([0-9]+,[0-9]{2})", text_row)
                 if matches:
                     try:
@@ -248,9 +210,49 @@ class NfceParserSP:
                 }
             )
 
+        if itens:
+            return itens
+
+        # ---------- B) Regex no texto completo ----------
+        text = soup.get_text(" ", strip=True)
+
+        # padrão do seu HTML:
+        # "BISNAG PANCO 300G (Código: 7891203010605 ) Qtde.: 1 UN: UN Vl. Unit.: 8,99 | Vl. Total 8,99"
+        item_re = re.compile(
+            r"(?P<desc>.+?)\s*\(Código:\s*(?P<codigo>[^)]+)\)\s*"
+            r".*?Qtde\.\:\s*(?P<qtd>[0-9,.]+)\s*"
+            r".*?UN:\s*(?P<un>[A-Z]+)\s*"
+            r".*?Vl\.\s*Unit\.\:\s*(?P<vu>[0-9,.]+)\s*"
+            r".*?Vl\.\s*Total\s*(?P<vt>[0-9,.]+)",
+            re.IGNORECASE,
+        )
+
+        for m in item_re.finditer(text):
+            desc = m.group("desc").strip()
+            qtd = self._to_float(m.group("qtd")) or 1.0
+            vu = self._to_float(m.group("vu"))
+            vt = self._to_float(m.group("vt"))
+            if vt is None:
+                continue
+
+            itens.append(
+                {
+                    "item": desc,
+                    "quantidade": qtd,
+                    "valor_unitario": vu if vu is not None else round(vt / qtd, 2),
+                    "valor_total": vt,
+                    "data_compra": data_compra,
+                }
+            )
+
         return itens
 
     def _extract_total(self, soup: BeautifulSoup) -> Optional[float]:
+        # "Valor a pagar R$:236,09"
+        m = re.search(r"Valor a pagar\s*R\$\:\s*([0-9,.]+)", soup.get_text(" ", strip=True), re.IGNORECASE)
+        if m:
+            return self._to_float(m.group(1))
+
         total_elem = soup.find(class_="txtMax")
         if total_elem:
             try:
@@ -258,11 +260,18 @@ class NfceParserSP:
             except Exception:
                 pass
 
-        m = re.search(r"Valor a Pagar.*?([0-9]+,[0-9]{2})", soup.get_text(), re.IGNORECASE)
-        if m:
-            try:
-                return float(m.group(1).replace(",", "."))
-            except Exception:
-                return None
-
         return None
+
+    def _extract_float(self, text: str, pattern: str) -> Optional[float]:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            return None
+        return self._to_float(m.group(1))
+
+    def _to_float(self, s: Optional[str]) -> Optional[float]:
+        if not s:
+            return None
+        try:
+            return float(str(s).strip().replace(".", "").replace(",", "."))
+        except Exception:
+            return None
