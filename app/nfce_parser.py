@@ -167,8 +167,7 @@ class NfceParserSP:
     def _extract_items_sp(self, soup: BeautifulSoup, data_compra: Optional[str]) -> List[Dict]:
         text = soup.get_text(" ", strip=True)
 
-        # normalizações para o layout que veio:
-        # "**Qtde.:**1**UN:** UN**Vl. Unit.:** 15,89 | Vl. Total 15,89"
+        # normalizações
         text = text.replace("**", " ")
         text = text.replace("|", " ")
         text = re.sub(r"\s+", " ", text).strip()
@@ -177,9 +176,9 @@ class NfceParserSP:
 
         item_re = re.compile(
             r"(?P<desc>.+?)\s*\(Código:\s*(?P<codigo>[^)]+)\)\s*"
-            r".*?Qtde\.\:\s*(?P<qtd>[0-9,.]+)\s*"
+            r".*?Qtde\.\:?\s*(?P<qtd>[0-9,.]+)\s*"
             r".*?UN\:\s*(?P<un>[A-Z]+)\s*"
-            r".*?Vl\.\s*Unit\.\:\s*(?P<vu>[0-9,.]+)\s*"
+            r".*?Vl\.\s*Unit\.\:?\s*(?P<vu>[0-9,.]+)\s*"
             r".*?Vl\.\s*Total\s*(?P<vt>[0-9,.]+)",
             re.IGNORECASE,
         )
@@ -200,9 +199,26 @@ class NfceParserSP:
                     "valor_total": vt,
                     "data_compra": data_compra,
                 }
+
+            debug = {
+                    "html_len": len(html or ""),
+                    "text_head": soup.get_text(" ", strip=True)[:250],
+                    "match_codigo": "(Código:" in soup.get_text(" ", strip=True),
+                    "match_vl_total": "Vl. Total" in soup.get_text(" ", strip=True),
+                    "items_found": len(itens),
+                }
+
             )
 
-        return itens
+        return {
+            "tipo_documento": "gasto",
+            "itens": itens,
+            "total_nota": total_nota,
+            "data_compra": data_compra,
+            "origem": "nfce_sp_qrcode_browser",
+            "debug": debug,
+        }
+
 
         # ---------- B) Regex no texto completo ----------
         text = soup.get_text(" ", strip=True)
