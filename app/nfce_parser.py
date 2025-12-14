@@ -150,68 +150,44 @@ class NfceParserSP:
         return None
 
     def _extract_items_sp(self, soup: BeautifulSoup, data_compra: Optional[str]) -> List[Dict]:
-        """
-        Tenta 2 estratégias:
-        A) DOM (tr/td + classes txtTit/valor)
-        B) Regex no texto completo (muito robusto pro layout SP)
-        """
+        text = soup.get_text(" ", strip=True)
+
+        # normalizações para o layout que veio:
+        # "**Qtde.:**1**UN:** UN**Vl. Unit.:** 15,89 | Vl. Total 15,89"
+        text = text.replace("**", " ")
+        text = text.replace("|", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+
         itens: List[Dict] = []
 
-        # ---------- A) DOM ----------
-        rows = soup.find_all("tr", id=re.compile(r"Item"))
-        if not rows:
-            table = soup.find("table", {"id": "tabResult"})
-            if table:
-                rows = table.find_all("tr")
-        if not rows:
-            rows = soup.find_all("tr")
+        item_re = re.compile(
+            r"(?P<desc>.+?)\s*\(Código:\s*(?P<codigo>[^)]+)\)\s*"
+            r".*?Qtde\.\:\s*(?P<qtd>[0-9,.]+)\s*"
+            r".*?UN\:\s*(?P<un>[A-Z]+)\s*"
+            r".*?Vl\.\s*Unit\.\:\s*(?P<vu>[0-9,.]+)\s*"
+            r".*?Vl\.\s*Total\s*(?P<vt>[0-9,.]+)",
+            re.IGNORECASE,
+        )
 
-        for row in rows:
-            text_row = row.get_text(" ", strip=True)
-            if not text_row:
-                continue
-
-            # indícios
-            if "(Código:" not in text_row and "Vl. Total" not in text_row and "Vl.Total" not in text_row:
-                continue
-
-            nome_elem = row.find(class_="txtTit") or row.find(class_="fixo-prod-serv-descricao")
-            nome = nome_elem.get_text(strip=True) if nome_elem else None
-            if not nome and "(Código:" in text_row:
-                nome = text_row.split("(Código:")[0].strip()
-
-            if not nome or "Descrição" in nome or "Qtde" in nome:
-                continue
-
-            qtd = self._extract_float(text_row, r"Qtde\.?\:?\s*([0-9,.]+)") or 1.0
-            valor_unit = self._extract_float(text_row, r"Vl\.\s*Unit\.\:?\s*([0-9,.]+)")
-            if valor_unit is None:
-                valor_unit = self._extract_float(text_row, r"Unit\.?\:?\s*([0-9,.]+)")
-
-            valor_total = self._extract_float(text_row, r"Vl\.\s*Total\s*([0-9,.]+)")
-            if valor_total is None:
-                matches = re.findall(r"([0-9]+,[0-9]{2})", text_row)
-                if matches:
-                    try:
-                        valor_total = float(matches[-1].replace(",", "."))
-                    except Exception:
-                        valor_total = None
-
-            if valor_total is None:
+        for m in item_re.finditer(text):
+            desc = m.group("desc").strip()
+            qtd = self._to_float(m.group("qtd")) or 1.0
+            vu = self._to_float(m.group("vu"))
+            vt = self._to_float(m.group("vt"))
+            if vt is None:
                 continue
 
             itens.append(
                 {
-                    "item": nome,
+                    "item": desc,
                     "quantidade": qtd,
-                    "valor_unitario": valor_unit if valor_unit is not None else round(valor_total / qtd, 2),
-                    "valor_total": valor_total,
+                    "valor_unitario": vu if vu is not None else round(vt / qtd, 2),
+                    "valor_total": vt,
                     "data_compra": data_compra,
                 }
             )
 
-        if itens:
-            return itens
+        return itens
 
         # ---------- B) Regex no texto completo ----------
         text = soup.get_text(" ", strip=True)
@@ -271,7 +247,13 @@ class NfceParserSP:
     def _to_float(self, s: Optional[str]) -> Optional[float]:
         if not s:
             return None
+        s = str(s).strip().replace(" ", "")
+        # 1.234,56 -> 1234.56
+        if s.count(",") == 1 and s.count(".") >= 1:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", ".")
         try:
-            return float(str(s).strip().replace(".", "").replace(",", "."))
+            return float(s)
         except Exception:
             return None
