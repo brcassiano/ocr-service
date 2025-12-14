@@ -60,21 +60,46 @@ class QrCodeBody(BaseModel):
 
 @app.post("/api/nfce/from-qrcode")
 async def nfce_from_qrcode(body: QrCodeBody):
-    parser = NfceParserSP()
+    # Debug ligado para inspecionar "text_head/flags" quando vier itens=[]
+    # (pode desligar depois, passando enable_debug=False)
+    parser = NfceParserSP(enable_debug=True)
+
     try:
         data = await parser.parse(body.qrcode_url)
+
+        # normaliza payload
         data["qrcode_url"] = body.qrcode_url
-        data.setdefault("confianca", 1.0 if data.get("itens") else 0.0)
+        data["confianca"] = 1.0 if data.get("itens") else 0.0
+        data.setdefault("tipo_documento", "gasto")
+        data.setdefault("itens", [])
+        data.setdefault("total_nota", None)
+        data.setdefault("data_compra", None)
+        data.setdefault("origem", "nfce_sp_qrcode")
+
+        # garante debug sempre presente (evita “sempre a mesma resposta” sem pista)
+        data.setdefault(
+            "debug",
+            {
+                "enabled": True,
+                "note": "Parser não retornou bloco de debug (verifique se o nfce_parser.py em runtime é o correto).",
+            },
+        )
+
         return JSONResponse(content=data)
+
     except Exception as e:
         logger.error(f"Erro nfce_from_qrcode: {e}", exc_info=True)
         return JSONResponse(
             content={
                 "tipo_documento": "erro",
                 "itens": [],
+                "total_nota": None,
+                "data_compra": None,
+                "origem": "nfce_sp_qrcode",
                 "qrcode_url": body.qrcode_url,
                 "mensagem": f"Erro ao consultar NFC-e via QRCode: {str(e)}",
                 "confianca": 0.0,
+                "debug": {"enabled": True, "exception": str(e)},
             },
             status_code=200,
         )
