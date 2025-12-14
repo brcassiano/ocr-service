@@ -9,14 +9,6 @@ logger = logging.getLogger(__name__)
 
 
 class NfceParserSP:
-    """
-    Parser NFC-e SP a partir do link do QRCode.
-
-    Estratégia:
-    - tenta requests (às vezes vem completo)
-    - fallback Playwright (renderiza JS)
-    """
-
     def __init__(self, timeout: int = 25, enable_debug: bool = False):
         self.timeout = timeout
         self.enable_debug = enable_debug
@@ -26,9 +18,17 @@ class NfceParserSP:
             "Chrome/120.0.0.0 Safari/537.36"
         )
 
+    def _clean_url(self, url: str) -> str:
+        return url.split("|")[0] if "|" in url else url
+
     def fetch_html_static(self, url: str) -> str:
-        url_clean = url.split("|")[0] if "|" in url else url
-        headers = {"User-Agent": self.user_agent}
+        url_clean = self._clean_url(url)
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Connection": "keep-alive",
+        }
         resp = requests.get(url_clean, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         return resp.text
@@ -36,46 +36,44 @@ class NfceParserSP:
     async def fetch_html_dynamic(self, url: str) -> str:
         from playwright.async_api import async_playwright
 
-        url_clean = url.split("|")[0] if "|" in url else url
-        logger.info(f"[PW] goto: {url_clean[:120]}")
+        url_clean = self._clean_url(url)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",  # stealth-lite [web:191]
+                ],
+            )
             try:
                 context = await browser.new_context(
                     user_agent=self.user_agent,
-                    viewport={"width": 1280, "height": 720},
                     locale="pt-BR",
+                    viewport={"width": 1280, "height": 720},
                 )
+
+                # esconde webdriver (stealth-lite) [web:193]
+                await context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+
                 page = await context.new_page()
+                await page.goto(url_clean, timeout=60000, wait_until="domcontentloaded")
 
-                # "networkidle" costuma ser mais estável que "domcontentloaded"
-                await page.goto(url_clean, timeout=60000, wait_until="networkidle")  # [web:180]
-
-                # Espera o TEXTO do DANFE aparecer (mais robusto que selector)
-                await page.wait_for_function(
-                    """() => {
-                        const t = (document.body && document.body.innerText) ? document.body.innerText : "";
-                        return t.includes("(Código:") ||
-                               t.includes("Valor a pagar") ||
-                               t.includes("DOCUMENTO AUXILIAR");
-                    }""",
-                    timeout=30000,
-                )  # [web:177]
+                # espera mais “humana”: dá tempo do JS preencher a tela
+                await page.wait_for_timeout(2500)
 
                 html = await page.content()
-                final_url = page.url
-                logger.info(f"[PW] final_url={final_url}")
-                logger.info(f"[PW] html_len={len(html)}")
 
                 if self.enable_debug:
                     try:
                         txt = await page.locator("body").inner_text()
-                        with open("/tmp/nfce_sp.html", "w", encoding="utf-8") as f:
+                        with open("/tmp/nfce_sp_pw.html", "w", encoding="utf-8") as f:
                             f.write(html)
-                        with open("/tmp/nfce_sp.txt", "w", encoding="utf-8") as f:
+                        with open("/tmp/nfce_sp_pw.txt", "w", encoding="utf-8") as f:
                             f.write(txt)
-                        logger.info(f"[PW] body_text_len={len(txt)} head={txt[:250]}")
+                        logger.info(f"[PW] final_url={page.url} body_text_len={len(txt)}")
                     except Exception as e:
                         logger.warning(f"[PW] dump falhou: {e}")
 
@@ -84,38 +82,50 @@ class NfceParserSP:
                 await browser.close()
 
     async def parse(self, url: str) -> Dict:
-        html: Optional[str] = None
-        origem = "nfce_sp_qrcode_static"
-
-        # 1) requests
+        # 1) tenta requests (melhor quando o Playwright é bloqueado) [web:1]
+        html_static = None
         try:
-            html = self.fetch_html_static(url)
-        except Exception as e:
-            logger.warning(f"Falha fetch estático: {e}")
-            html = None
-
-        if html and not self._is_session_expired(html):
-            soup = BeautifulSoup(html, "html.parser")
+            html_static = self.fetch_html_static(url)
+            soup = BeautifulSoup(html_static, "html.parser")
             data_compra = self._extract_date(soup)
             itens = self._extract_items_sp(soup, data_compra)
             total_nota = self._extract_total(soup)
 
-            if itens:
+            # se o HTML estático já tem os sinais, retorna
+            if itens or self._looks_like_danfe(soup):
                 out = {
                     "tipo_documento": "gasto",
                     "itens": itens,
                     "total_nota": total_nota,
                     "data_compra": data_compra,
-                    "origem": origem,
+                    "origem": "nfce_sp_qrcode_static",
                 }
                 if self.enable_debug:
-                    out["debug"] = self._debug_block(html, soup, itens)
+                    out["debug"] = self._debug_block(html_static, soup, itens)
                 return out
 
-        # 2) Playwright
-        origem = "nfce_sp_qrcode_browser"
+        except Exception as e:
+            logger.warning(f"Falha no requests: {e}")
+
+        # 2) fallback Playwright (quando requests não resolve) [web:121]
         try:
             html = await self.fetch_html_dynamic(url)
+            soup = BeautifulSoup(html, "html.parser")
+            data_compra = self._extract_date(soup)
+            itens = self._extract_items_sp(soup, data_compra)
+            total_nota = self._extract_total(soup)
+
+            out = {
+                "tipo_documento": "gasto",
+                "itens": itens,
+                "total_nota": total_nota,
+                "data_compra": data_compra,
+                "origem": "nfce_sp_qrcode_browser",
+            }
+            if self.enable_debug:
+                out["debug"] = self._debug_block(html, soup, itens)
+            return out
+
         except ModuleNotFoundError:
             return {
                 "tipo_documento": "erro",
@@ -123,7 +133,8 @@ class NfceParserSP:
                 "total_nota": None,
                 "data_compra": None,
                 "origem": "nfce_sp_qrcode",
-                "mensagem": "HTML estático não retornou itens e playwright não está instalado.",
+                "mensagem": "Playwright não instalado no ambiente.",
+                "debug": {"static_tried": bool(html_static)},
             }
         except Exception as e:
             return {
@@ -133,26 +144,14 @@ class NfceParserSP:
                 "data_compra": None,
                 "origem": "nfce_sp_qrcode",
                 "mensagem": f"Falha ao consultar via Playwright: {str(e)}",
+                "debug": {"static_tried": bool(html_static)},
             }
 
-        soup = BeautifulSoup(html, "html.parser")
-
-        data_compra = self._extract_date(soup)
-        itens = self._extract_items_sp(soup, data_compra)
-        total_nota = self._extract_total(soup)
-
-        out = {
-            "tipo_documento": "gasto",
-            "itens": itens,
-            "total_nota": total_nota,
-            "data_compra": data_compra,
-            "origem": origem,
-        }
-        if self.enable_debug:
-            out["debug"] = self._debug_block(html, soup, itens)
-        return out
-
     # ---------------- helpers ----------------
+    def _looks_like_danfe(self, soup: BeautifulSoup) -> bool:
+        t = soup.get_text(" ", strip=True)
+        return ("DOCUMENTO AUXILIAR" in t) or ("Chave de acesso" in t)
+
     def _debug_block(self, html: str, soup: BeautifulSoup, itens: List[Dict]) -> Dict:
         page_text = soup.get_text(" ", strip=True)
         return {
@@ -162,12 +161,9 @@ class NfceParserSP:
             "has_codigo": "(Código:" in page_text,
             "has_qtde": "Qtde" in page_text,
             "has_vl_total": "Vl. Total" in page_text,
+            "has_doc_aux": "DOCUMENTO AUXILIAR" in page_text,
             "items_found": len(itens),
         }
-
-    def _is_session_expired(self, html: str) -> bool:
-        h = (html or "").lower()
-        return ("sessão expirou" in h) or ("sessao expirou" in h)
 
     def _extract_date(self, soup: BeautifulSoup) -> Optional[str]:
         txt = soup.get_text(" ", strip=True)
@@ -220,11 +216,9 @@ class NfceParserSP:
         m = re.search(r"Valor a pagar\s*R\$\:?\s*([0-9.,]+)", txt, re.IGNORECASE)
         if m:
             return self._to_float(m.group(1))
-
         total_elem = soup.find(class_="txtMax")
         if total_elem:
             return self._to_float(total_elem.get_text(strip=True))
-
         return None
 
     def _to_float(self, s: Optional[str]) -> Optional[float]:
