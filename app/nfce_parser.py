@@ -14,12 +14,12 @@ class NfceParserSP:
 
     Estratégia:
     - requests -> parse HTML
-    - extrai itens por DOM; se falhar, extrai por regex no texto completo.
-    - Playwright vira apenas fallback opcional (se instalado).
+    - se não encontrar itens, usa Playwright (se instalado)
     """
 
-    def __init__(self, timeout: int = 25):
+    def __init__(self, timeout: int = 25, enable_debug: bool = False):
         self.timeout = timeout
+        self.enable_debug = enable_debug
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -48,33 +48,39 @@ class NfceParserSP:
             try:
                 context = await browser.new_context(user_agent=self.user_agent)
                 page = await context.new_page()
+
                 await page.goto(url_clean, timeout=30000, wait_until="domcontentloaded")
                 try:
                     await page.wait_for_selector("table", timeout=10000)
                 except Exception:
                     logger.warning("Timeout esperando tabela. Tentando ler o que carregou...")
+
                 html = await page.content()
                 logger.info(f"[PW] url_final={page.url}")
                 logger.info(f"[PW] html_len={len(html)}")
 
-                # salva arquivo pra inspecionar no container (ajuda demais)
-                with open("/tmp/nfce_sp.html", "w", encoding="utf-8") as f:
-                    f.write(html)
+                # dumps para inspeção
+                try:
+                    with open("/tmp/nfce_sp.html", "w", encoding="utf-8") as f:
+                        f.write(html)
 
-                # e salva também um “texto limpo” (pra validar regex)
-                txt = await page.locator("body").inner_text()
-                with open("/tmp/nfce_sp.txt", "w", encoding="utf-8") as f:
-                    f.write(txt)
+                    txt = await page.locator("body").inner_text()
+                    with open("/tmp/nfce_sp.txt", "w", encoding="utf-8") as f:
+                        f.write(txt)
 
-                logger.info(f"[PW] body_text_len={len(txt)}")
-                logger.info(f"[PW] body_text_head={txt[:300]}")
+                    logger.info(f"[PW] body_text_len={len(txt)}")
+                    logger.info(f"[PW] body_text_head={txt[:300]}")
+                except Exception as e:
+                    logger.warning(f"[PW] Falha ao gravar dumps: {e}")
 
-                logger.info(f"HTML dinâmico carregado len={len(html)}")
                 return html
             finally:
                 await browser.close()
 
     async def parse(self, url: str) -> Dict:
+        html: Optional[str] = None
+        origem = "nfce_sp_qrcode_static"
+
         # 1) requests
         try:
             html = self.fetch_html_static(url)
@@ -82,7 +88,7 @@ class NfceParserSP:
             logger.warning(f"Falha fetch estático: {e}")
             html = None
 
-        # 2) tenta parse no estático
+        # 2) parse estático
         if html and not self._is_session_expired(html):
             soup = BeautifulSoup(html, "html.parser")
             data_compra = self._extract_date(soup)
@@ -90,15 +96,19 @@ class NfceParserSP:
             total_nota = self._extract_total(soup)
 
             if itens:
-                return {
+                out = {
                     "tipo_documento": "gasto",
                     "itens": itens,
                     "total_nota": total_nota,
                     "data_compra": data_compra,
-                    "origem": "nfce_sp_qrcode_static",
+                    "origem": origem,
                 }
+                if self.enable_debug:
+                    out["debug"] = self._debug_block(html, soup, itens)
+                return out
 
-        # 3) fallback Playwright (se existir)
+        # 3) fallback Playwright
+        origem = "nfce_sp_qrcode_browser"
         try:
             html = await self.fetch_html_dynamic(url)
         except ModuleNotFoundError:
@@ -135,26 +145,39 @@ class NfceParserSP:
         itens = self._extract_items_sp(soup, data_compra)
         total_nota = self._extract_total(soup)
 
-        return {
+        out = {
             "tipo_documento": "gasto",
             "itens": itens,
             "total_nota": total_nota,
             "data_compra": data_compra,
-            "origem": "nfce_sp_qrcode_browser",
+            "origem": origem,
         }
+        if self.enable_debug:
+            out["debug"] = self._debug_block(html, soup, itens)
+        return out
 
     # ---------------- helpers ----------------
+    def _debug_block(self, html: str, soup: BeautifulSoup, itens: List[Dict]) -> Dict:
+        page_text = soup.get_text(" ", strip=True)
+        return {
+            "html_len": len(html or ""),
+            "text_len": len(page_text),
+            "text_head": page_text[:250],
+            "has_codigo": "(Código:" in page_text,
+            "has_qtde": "Qtde" in page_text,
+            "has_vl_total": "Vl. Total" in page_text,
+            "items_found": len(itens),
+        }
+
     def _is_session_expired(self, html: str) -> bool:
         h = (html or "").lower()
         return ("sessão expirou" in h) or ("sessao expirou" in h)
 
     def _extract_date(self, soup: BeautifulSoup) -> Optional[str]:
-        # Emissão: 11/12/2025 18:57:55
         m = re.search(r"Emissão:\s*(\d{2}/\d{2}/\d{4})", soup.get_text(" ", strip=True), re.IGNORECASE)
         if m:
             return m.group(1)
 
-        # fallback antigo
         for strong in soup.find_all("strong"):
             if "Emissão" in strong.get_text():
                 text = strong.parent.get_text()
@@ -167,7 +190,7 @@ class NfceParserSP:
     def _extract_items_sp(self, soup: BeautifulSoup, data_compra: Optional[str]) -> List[Dict]:
         text = soup.get_text(" ", strip=True)
 
-        # normalizações
+        # normalizações (por segurança)
         text = text.replace("**", " ")
         text = text.replace("|", " ")
         text = re.sub(r"\s+", " ", text).strip()
@@ -179,58 +202,6 @@ class NfceParserSP:
             r".*?Qtde\.\:?\s*(?P<qtd>[0-9,.]+)\s*"
             r".*?UN\:\s*(?P<un>[A-Z]+)\s*"
             r".*?Vl\.\s*Unit\.\:?\s*(?P<vu>[0-9,.]+)\s*"
-            r".*?Vl\.\s*Total\s*(?P<vt>[0-9,.]+)",
-            re.IGNORECASE,
-        ),
-
-        for m in item_re.finditer(text):
-            desc = m.group("desc").strip()
-            qtd = self._to_float(m.group("qtd")) or 1.0
-            vu = self._to_float(m.group("vu"))
-            vt = self._to_float(m.group("vt"))
-            if vt is None:
-                continue
-
-            itens.append(
-                {
-                    "item": desc,
-                    "quantidade": qtd,
-                    "valor_unitario": vu if vu is not None else round(vt / qtd, 2),
-                    "valor_total": vt,
-                    "data_compra": data_compra,
-                },
-            
-
-            debug = {
-                    "html_len": len(html or ""),
-                    "text_head": soup.get_text(" ", strip=True)[:250],
-                    "match_codigo": "(Código:" in soup.get_text(" ", strip=True),
-                    "match_vl_total": "Vl. Total" in soup.get_text(" ", strip=True),
-                    "items_found": len(itens),
-                }
-
-            )
-
-        return {
-            "tipo_documento": "gasto",
-            "itens": itens,
-            "total_nota": total_nota,
-            "data_compra": data_compra,
-            "origem": "nfce_sp_qrcode_browser",
-            "debug": debug,
-        }
-
-
-        # ---------- B) Regex no texto completo ----------
-        text = soup.get_text(" ", strip=True)
-
-        # padrão do seu HTML:
-        # "BISNAG PANCO 300G (Código: 7891203010605 ) Qtde.: 1 UN: UN Vl. Unit.: 8,99 | Vl. Total 8,99"
-        item_re = re.compile(
-            r"(?P<desc>.+?)\s*\(Código:\s*(?P<codigo>[^)]+)\)\s*"
-            r".*?Qtde\.\:\s*(?P<qtd>[0-9,.]+)\s*"
-            r".*?UN:\s*(?P<un>[A-Z]+)\s*"
-            r".*?Vl\.\s*Unit\.\:\s*(?P<vu>[0-9,.]+)\s*"
             r".*?Vl\.\s*Total\s*(?P<vt>[0-9,.]+)",
             re.IGNORECASE,
         )
@@ -256,8 +227,7 @@ class NfceParserSP:
         return itens
 
     def _extract_total(self, soup: BeautifulSoup) -> Optional[float]:
-        # "Valor a pagar R$:236,09"
-        m = re.search(r"Valor a pagar\s*R\$\:\s*([0-9,.]+)", soup.get_text(" ", strip=True), re.IGNORECASE)
+        m = re.search(r"Valor a pagar\s*R\$\:?\s*([0-9.,]+)", soup.get_text(" ", strip=True), re.IGNORECASE)
         if m:
             return self._to_float(m.group(1))
 
@@ -270,17 +240,10 @@ class NfceParserSP:
 
         return None
 
-    def _extract_float(self, text: str, pattern: str) -> Optional[float]:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if not m:
-            return None
-        return self._to_float(m.group(1))
-
     def _to_float(self, s: Optional[str]) -> Optional[float]:
         if not s:
             return None
         s = str(s).strip().replace(" ", "")
-        # 1.234,56 -> 1234.56
         if s.count(",") == 1 and s.count(".") >= 1:
             s = s.replace(".", "").replace(",", ".")
         else:
