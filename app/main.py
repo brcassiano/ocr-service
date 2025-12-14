@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from .ocr_engine import OCREngine
 from .models import QRCodeResponse, HealthResponse
 from . import __version__
+from pydantic import BaseModel
+from .nfce_parser import NfceParserSP
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +86,28 @@ async def extract_comprovante(file: UploadFile = File(...)):
                 "itens": [],
                 "qrcode_url": None,
                 "mensagem": f"Erro interno: {str(e)}",
+                "confianca": 0.0,
+            },
+            status_code=200,
+        )
+    
+ @app.post("/api/nfce/from-qrcode")
+async def nfce_from_qrcode(body: QrCodeBody):
+    parser = NfceParserSP()
+
+    try:
+        data = await parser.parse(body.qrcode_url)
+        data["qrcode_url"] = body.qrcode_url
+        data.setdefault("confianca", 1.0 if data.get("itens") else 0.0)
+        return JSONResponse(content=data)
+    except Exception as e:
+        logger.error(f"Erro nfce_from_qrcode: {e}", exc_info=True)
+        return JSONResponse(
+            content={
+                "tipo_documento": "erro",
+                "itens": [],
+                "qrcode_url": body.qrcode_url,
+                "mensagem": f"Erro ao consultar NFC-e via QRCode: {str(e)}",
                 "confianca": 0.0,
             },
             status_code=200,
