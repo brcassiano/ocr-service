@@ -181,7 +181,7 @@ class NfceParserSP:
             r".*?Vl\.\s*Unit\.\:?\s*(?P<vu>[0-9,.]+)\s*"
             r".*?Vl\.\s*Total\s*(?P<vt>[0-9,.]+)",
             re.IGNORECASE,
-        )
+        ),
 
         for m in item_re.finditer(text):
             desc = m.group("desc").strip()
@@ -198,7 +198,8 @@ class NfceParserSP:
                     "valor_unitario": vu if vu is not None else round(vt / qtd, 2),
                     "valor_total": vt,
                     "data_compra": data_compra,
-                }
+                },
+            
 
             debug = {
                     "html_len": len(html or ""),
