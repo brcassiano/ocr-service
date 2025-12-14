@@ -54,6 +54,21 @@ class NfceParserSP:
                 except Exception:
                     logger.warning("Timeout esperando tabela. Tentando ler o que carregou...")
                 html = await page.content()
+                logger.info(f"[PW] url_final={page.url}")
+                logger.info(f"[PW] html_len={len(html)}")
+
+                # salva arquivo pra inspecionar no container (ajuda demais)
+                with open("/tmp/nfce_sp.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+
+                # e salva também um “texto limpo” (pra validar regex)
+                txt = await page.locator("body").inner_text()
+                with open("/tmp/nfce_sp.txt", "w", encoding="utf-8") as f:
+                    f.write(txt)
+
+                logger.info(f"[PW] body_text_len={len(txt)}")
+                logger.info(f"[PW] body_text_head={txt[:300]}")
+
                 logger.info(f"HTML dinâmico carregado len={len(html)}")
                 return html
             finally:
