@@ -32,6 +32,7 @@ class NfceParserSP:
 
         headers = {"User-Agent": self.user_agent}
         resp = requests.get(url_clean, headers=headers, timeout=self.timeout)
+        logger.info(f"HTML len={len(resp.text)} status={resp.status_code}")
         resp.raise_for_status()
         return resp.text
 
@@ -42,6 +43,7 @@ class NfceParserSP:
 
         url_clean = url.split("|")[0] if "|" in url else url
         logger.info(f"Abrindo navegador (Playwright) para: {url_clean[:60]}...")
+        logger.info(f"Static signals: table={has_table} item_rows={has_item_rows} tabResult={has_tabresult} txtTit={has_txttit} valor={has_valor}")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -80,13 +82,27 @@ class NfceParserSP:
                 has_table = bool(soup.find("table"))
                 has_item_rows = bool(soup.find_all("tr", id=re.compile(r"Item")))
                 has_tabresult = bool(soup.find("table", {"id": "tabResult"}))
-                if not (has_table or has_item_rows or has_tabresult):
-                    logger.warning("HTML estático sem tabela/itens; indo para Playwright.")
+                has_txttit = bool(soup.select_one(".txtTit"))   # título do item
+                has_valor = bool(soup.select_one(".valor"))     # valor do item
+                if not (has_table or has_item_rows or has_tabresult or has_txttit or has_valor):
+                    logger.warning("HTML estático sem sinais de itens; indo para Playwright.")
                     html = None
+
 
         # 3) fallback dinâmico
         if not html:
-            html = await self.fetch_html_dynamic(url)
+            try:
+                html = await self.fetch_html_dynamic(url)
+            except ModuleNotFoundError:
+                return {
+                    "tipo_documento": "erro",
+                    "itens": [],
+                    "total_nota": None,
+                    "data_compra": None,
+                    "origem": "nfce_sp_qrcode",
+                    "mensagem": "HTML estático não veio parseável e playwright não está instalado.",
+                }
+
 
         soup = BeautifulSoup(html, "html.parser")
 
