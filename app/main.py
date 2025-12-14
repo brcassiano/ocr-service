@@ -91,7 +91,7 @@ async def extract_comprovante(file: UploadFile = File(...)):
             status_code=200,
         )
     
- @app.post("/api/nfce/from-qrcode")
+@app.post("/api/nfce/from-qrcode")
 async def nfce_from_qrcode(body: QrCodeBody):
     parser = NfceParserSP()
 
