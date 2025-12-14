@@ -22,6 +22,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+RUN python -m playwright install --with-deps chromium
+
+
 # 3. Pré-baixar modelos PaddleOCR (Cache no build)
 # Isso evita download na hora do startup
 RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='pt', show_log=False); print('✓ Modelos baixados')" || echo "Falha no download"
